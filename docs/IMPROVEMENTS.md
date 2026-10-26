@@ -1051,7 +1051,7 @@ Copy this into an issue per phase.
 
 ## Appendix — implementation status (2026-10-27)
 
-The suite has grown from 158 to **213 checks** while every item below landed; `npm test`,
+The suite has grown from 158 to **221 checks** while every item below landed; `npm test`,
 `npm run lint` and `npm run check` are green after each batch.
 
 The second appendix below (`Appendix B`) records the multi-file / illustration / GitHub
@@ -1074,14 +1074,17 @@ work, which is a different axis from the review items.
 | Version drift | D-5 | README, `docs/ARCHITECTURE.md` and `package-lock.json` now agree with `package.json` at 1.5.1. |
 | Test suite | #10 (partial) | New `tests/improvements.js`, `tests/enhancements.js` and `tests/unit-ui.js`: the panel's pure helpers (escaping, colour formats, relative dates, the ZIP writer, the syntax highlighter) are now unit-tested in a VM, alongside adversarial trees, token aliases, parser-level SVG evasion and export responses. |
 | Manifest | — | The `unit` preference covers every web target and `gate` covers all twelve languages. |
+| Accessibility 2.0 | #7, IMP-31, F-03 | See Appendix C: seven rule kinds with WCAG references, ignore-with-reason persisted per file, Markdown/CSV report export, and a panel section that explains what it can and cannot measure. |
 
 ### Still open
 
 Phase 2 codegen fidelity (masks, image crop/scale mode, gradients, dash/caps, layout grids,
-constraints, text truncation), Phase 3 accessibility 2.0 (non-text contrast, alt/heading/form
-checks, ignore-with-reason, exportable report), Phase 5 handoff report and history, native
-target compile checks, browser-level UI tests, and the fixture catalogue in §8
-(`unicode-hostile`, `grid-layout`, `variant-matrix`, `variables-heavy`, …).
+constraints, text truncation), the parts of accessibility 2.0 that need a rendered frame or a
+manual review (colour-only meaning, focus-indicator presence, motion, text spacing, reflow)
+rather than a static layer, per-rule toggles and a "select all failing layers" action,
+Phase 5 handoff report and history, native target compile checks, browser-level UI tests, and
+the fixture catalogue in §8 (`unicode-hostile`, `grid-layout`, `variant-matrix`,
+`variables-heavy`, …).
 
 *The backlog above is unchanged and still describes the remaining work; this appendix only
 records what has already been built and verified.*
@@ -1128,3 +1131,34 @@ regression net for all of it.
   states which signal fired.
 - `clientStorage` is per machine and per plugin instance: projects and revisions do not
   sync across devices, which is why the README calls the workspace local.
+
+---
+
+## Appendix C — Accessibility 2.0 (2026-10-27)
+
+Closes item #7 / IMP-31 / F-03 to the point where the audit can gate a release, and is explicit
+about the criteria a static design cannot answer. `tests/a11y2.js` (7 checks) is the regression
+net; the suite is **221 checks**.
+
+| Requested (F-03 / IMP-31) | Status | Where it lives |
+|---|---|---|
+| Rule engine with a WCAG reference per finding | **Shipped** | `A11Y_RULE` / `A11Y_RULE_TITLE` in `code.js`; every finding carries `rule` (`1.4.3`, `1.4.11`, `1.1.1`, `1.3.1`, `3.3.2`, `2.5.8`, `4.1.2`, `readability`) |
+| Non-text contrast (icons, control outlines) at 3:1 | **Shipped** | 1.4.11: icons are measured with the paint they actually draw (`firstSolidPaint`, including a paint inside the icon), interactive frames with their stroke; opaque parents are resolved, gradient/image backgrounds are reported as unmeasured |
+| Alt text / decorative images | **Shipped** | 1.1.1: layer name → alt text, decorative-name heuristic (`alt=""` + `aria-hidden` guidance), auto-generated name detector, raster icons inside an icon layer are artwork rather than content |
+| Heading structure | **Shipped** | 1.3.1: levels derived from the type scale (≥32 → 1, ≥24 → 2, ≥20 → 3, ≥18 bold → 4); a skipped level is reported in document order, and the level sequence is returned with the audit |
+| Form-field labelling | **Shipped** | 3.3.2: input/field/select/checkbox-like layers must contain visible text |
+| Ignore with a reason, persisted | **Shipped** | `a11y-ignore` / `a11y-unignore` → `figma.root` shared plugin data `devready`/`a11y-ignore` (`{nodeId: reason}`), six preset reasons, ≤120 entries, ≤20 kB, validated on read (garbage is ignored, not fatal); the panel shows the decision, the reason and its criterion, and *Unignore* restores it |
+| Exportable report | **Shipped** | `a11y-report` (`md` \| `csv`) → `devready-a11y-<slug>.md` / `.csv`: counts, failures per criterion, findings grouped by rule, the ignored list with reasons. Markdown flattens newlines and CSV escapes quotes, so a hostile layer name cannot break the file |
+| Honest limits | **Shipped** | Layer cap (400) and depth cap are reported as "stopped at the layer limit" / "deeper layers skipped"; unmeasurable contrast is `unknown`, never `pass`; opacity inherited from ancestors is included |
+| Colour-only meaning, focus-indicator presence, motion, text spacing, 1.4.10 reflow | **Open (by design)** | These need a rendered frame, an interaction or a manual review. A static plugin cannot observe them; `devready-plugin/README.md` and the panel's footnote say so instead of guessing |
+| Per-rule toggles, "select all failing layers" | **Open** | Would need an `a11y-config` message and a settings section; the audit is cheap enough (one pass, 400 layers) that filtering in the panel was the smaller correct step |
+
+**Limitations recorded rather than worked around**
+
+- Interactive detection is still a name regex plus `reactions` (IMP-32). A button named
+  `Primary/Default` is measured only for contrast, not for target size.
+- Alt text is inferred from a layer name — the only signal a plugin has. The report says the
+  value is *inferred*, so a reviewer knows it is a suggestion, not a guarantee.
+- Review decisions live in the file's shared plugin data: they need write access, which Dev
+  Mode may not have. In read-only Dev Mode the audit still runs and reports honestly, but
+  ignoring a finding is refused rather than silently lost.

@@ -46,7 +46,10 @@ function loadPanel() {
   };
   const sandbox = {
     console, setTimeout, clearTimeout, setInterval, clearInterval, Date, Math, JSON, Intl,
-    Uint8Array, Uint32Array, Uint16Array, ArrayBuffer, DataView, TextEncoder, TextDecoder, Blob: function () {}, URL, URLSearchParams,
+    Uint8Array, Uint32Array, Uint16Array, ArrayBuffer, DataView, TextEncoder, TextDecoder,
+    // A real Blob, so URL.createObjectURL (used by every download) can be exercised.
+    Blob: function (parts, opts) { this.parts = parts || []; this.type = (opts && opts.type) || ''; this.size = (this.parts[0] && this.parts[0].length) || 0; },
+    URL: class TestURL extends URL { static createObjectURL() { return 'blob:test'; } static revokeObjectURL() {} }, URLSearchParams,
     FileReader: function () { this.readAsDataURL = () => {}; },
     navigator: { language: 'en', clipboard: { writeText: async () => {} } },
     document, innerWidth: 480, innerHeight: 820,

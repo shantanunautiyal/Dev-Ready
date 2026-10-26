@@ -92,6 +92,26 @@ Two known causes, both visible in the UI:
 For layout differences, use **Code → Preview → Overlay → Difference**: identical
 pixels go black, so anything bright is a mismatch.
 
+### The accessibility audit flags something I disagree with
+
+Ignore it with a reason instead of turning the audit off. Every finding row has an
+*Ignore* button with six reasons (decorative, brand exception, legacy design, false
+positive, will fix later, approved by design). The decision is written to the file's
+shared plugin data (`devready` / `a11y-ignore`), so it survives reloads, collaborators
+see it, and the exported report lists it under **Ignored** with its WCAG criterion.
+*Unignore* in the same section restores the finding. If the *Ignore* button is missing,
+the file is open read-only (Dev Mode) — the audit still runs, it just cannot record a
+decision.
+
+### Which accessibility criteria can the audit not check?
+
+Anything that only exists once the design is rendered or used: colour-only meaning
+(a red dot that carries the only signal), whether a focus ring is actually visible,
+motion and animation, text spacing, and 1.4.10 reflow. Those are named in the panel's
+footnote rather than guessed at. Everything else the audit reports with its WCAG
+reference (`1.4.3`, `1.4.11`, `1.1.1`, `1.3.1`, `3.3.2`, `2.5.8`, `4.1.2`), and a
+background it cannot measure is reported as *unmeasured*, never as a pass.
+
 ### Where do variables/light-dark mode end up in the code?
 
 Every Figma variable becomes a CSS custom property in `:root`, and **every mode**

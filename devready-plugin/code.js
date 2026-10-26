@@ -107,6 +107,10 @@ const MSG_SCHEMA = {
   'cancel': { jobId: V.int(1, Number.MAX_SAFE_INTEGER) },
   /* Per-layer plan: is it an illustration, how expensive is it, can it be generated. */
   'plan': {},
+  /* Accessibility review decisions and reporting. */
+  'a11y-ignore': { ids: v => Array.isArray(v) ? v.filter(x => typeof x === 'string' && x.length < 80).slice(0, 50) : undefined, reason: V.opt(V.str(120)) },
+  'a11y-unignore': { ids: v => Array.isArray(v) ? v.filter(x => typeof x === 'string' && x.length < 80).slice(0, 50) : undefined },
+  'a11y-report': { format: V.oneOf(['md', 'csv']) },
   /* Workspace state (projects, local revisions) lives in clientStorage, never in
      the document. Only these keys are readable, and only as bounded JSON. */
   'store-get': { key: V.oneOf(['projects', 'history']) },
@@ -3456,7 +3460,102 @@ function isInteractive(n) {
   return /^(FRAME|INSTANCE|COMPONENT)$/.test(n.type) && TARGET_NAME_RE.test(n.name || '');
 }
 /** WCAG references attached to each finding, so a report can cite the rule. */
-const A11Y_RULE = { contrast: '1.4.3', size: 'readability', target: '2.5.8', label: '4.1.2' };
+const A11Y_RULE = {
+  contrast: '1.4.3', size: 'readability', target: '2.5.8', label: '4.1.2',
+  nonText: '1.4.11', alt: '1.1.1', heading: '1.3.1', form: '3.3.2'
+};
+const A11Y_RULE_TITLE = {
+  '1.4.3': 'Text contrast', '1.4.11': 'Non-text contrast', '1.1.1': 'Image alternative',
+  '1.3.1': 'Info and relationships', '2.5.8': 'Target size', '4.1.2': 'Name, role, value',
+  '3.3.2': 'Labels or instructions', readability: 'Readability'
+};
+/** Review decisions are kept per file, so ignoring a finding is visible to the team. */
+const A11Y_IGNORE_KEY = 'a11y-ignore';
+const A11Y_IGNORE_MAX = 120;
+const A11Y_REASONS = ['Decorative', 'Brand exception', 'Legacy design', 'False positive', 'Will fix later', 'Approved by design'];
+const AUTO_LAYER_NAME_RE = /^(image|img|bitmap|picture|photo|rectangle|rounded ?rectangle|ellipse|vector|group|frame|shape|layer|mask|graphic)([\s._-]*\d+)?$/i;
+const DECORATIVE_NAME_RE = /(decorat|background|\bbg\b|pattern|texture|blob|spacer|divider|separator|shadow|glow|noise)/i;
+const FIELD_NAME_RE = /(^|[\s/_-])(input|field|text ?field|search|email|username|password|select|combobox|dropdown|textarea|checkbox|radio|toggle|phone|number field)([\s/_-]|$)/i;
+const ICON_NAME_RE = /(^|[\s/_.-])(icon|icons|glyph|glyphs|ic)([\s/_.-]|$)/i;
+/** Does this layer live under something the team calls an icon? A raster icon is
+ *  artwork, so asking for alt text there would be noise. */
+function inIconContext(n) {
+  let c = n, guard = 0;
+  while (c && guard++ < 4) {
+    if (ICON_NAME_RE.test(String(c.name || ''))) return true;
+    c = c.parent;
+  }
+  return false;
+}
+/** Alt-text decision for a layer that carries an image. */
+function altDecision(n) {
+  const name = String(n.name || '').trim();
+  if (!name) return { status: 'warn', detail: 'Unnamed image — rename the layer so its alt text can be written' };
+  if (DECORATIVE_NAME_RE.test(name)) return { status: 'pass', detail: 'Looks decorative — export it with alt="" and aria-hidden' };
+  if (AUTO_LAYER_NAME_RE.test(name)) return { status: 'warn', detail: 'Layer name "' + name.slice(0, 32) + '" is auto-generated — rename it to describe the image, or mark it decorative' };
+  return { status: 'pass', detail: 'Descriptive layer name — use it as the alt text' };
+}
+/** Heading level suggested by the type scale (0 = body text). */
+function headingLevel(size, weight) {
+  if (!(size > 0)) return 0;
+  if (size >= 32) return 1;
+  if (size >= 24) return 2;
+  if (size >= 20) return 3;
+  if (size >= 18 && weight >= 700) return 4;
+  return 0;
+}
+/** Is there readable text in this subtree? A manual walk, so it works on every
+ *  Figma API version (findOne is not available on every node type). */
+function hasVisibleText(n) {
+  if (!n) return false;
+  if (n.type === 'TEXT') return !!String(n.characters || '').trim();
+  let found = false;
+  (function walk(x, depth) {
+    if (found || depth > 40 || !('children' in x)) return;
+    for (const c of x.children) {
+      if (found) return;
+      if (c.visible === false) continue;
+      if (c.type === 'TEXT' && String(c.characters || '').trim()) { found = true; return; }
+      walk(c, depth + 1);
+    }
+  })(n, 0);
+  return found;
+}
+/** The paint an icon actually draws with: its own, or the first one inside it. */
+function firstSolidPaint(n) {
+  const own = topSolid(n.fills) || topSolid(n.strokes);
+  if (own && !own.unknown) return own;
+  let found = null;
+  (function walk(x, depth) {
+    if (found || depth > 6) return;
+    const f = topSolid(x.fills) || topSolid(x.strokes);
+    if (f && !f.unknown) { found = f; return; }
+    if ('children' in x) x.children.forEach(c => walk(c, depth + 1));
+  })(n, 0);
+  return found;
+}
+async function readA11yIgnore() {
+  try {
+    const raw = figma.root.getSharedPluginData(NS, A11Y_IGNORE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out = {};
+    Object.keys(parsed).slice(0, A11Y_IGNORE_MAX).forEach(k => {
+      if (typeof k === 'string' && k.length < 80 && typeof parsed[k] === 'string') out[k] = parsed[k].slice(0, 120);
+    });
+    return out;
+  } catch (e) { return {}; }
+}
+function writeA11yIgnore(map) {
+  const keys = Object.keys(map).slice(0, A11Y_IGNORE_MAX);
+  const clean = {};
+  keys.forEach(k => { clean[k] = String(map[k] || 'Ignored').slice(0, 120); });
+  const text = JSON.stringify(clean);
+  // Shared plugin data is per file and readable by collaborators: keep it small and plain.
+  figma.root.setSharedPluginData(NS, A11Y_IGNORE_KEY, text.length <= 20000 ? text : '{}');
+  return clean;
+}
 /**
  * Opacity that actually reaches a layer: Figma multiplies a layer's opacity with
  * every ancestor's. Reading only the layer's own value makes faded content look
@@ -3473,9 +3572,25 @@ function effectiveOpacity(node) {
   }
   return Math.max(0, Math.min(1, o));
 }
-function a11yAudit(root, limit) {
+/**
+ * WCAG 2.2 audit.
+ *
+ * Text contrast (1.4.3), non-text contrast for icons and control boundaries
+ * (1.4.11), image alternatives (1.1.1), heading order (1.3.1), field labels
+ * (3.3.2), target size (2.5.8), readable type, and a nameless-control check
+ * (4.1.2). Findings can be reviewed per file with a reason, and the whole audit
+ * can be exported as Markdown or CSV.
+ */
+function a11yAudit(root, limit, ignoreMap) {
+  const ignore = ignoreMap || {};
   const items = [];
+  const ignoredItems = [];
+  const headings = [];
   let scanned = 0, limited = false, depthLimited = false;
+  const push = it => {
+    if (ignore[it.id]) ignoredItems.push(Object.assign({}, it, { reason: ignore[it.id] }));
+    else items.push(it);
+  };
   const frameWidth = n => { let c = n, g = 0; while (c.parent && g++ < 60 && c.parent.type !== 'PAGE' && c.parent.type !== 'DOCUMENT' && c.parent.type !== 'SECTION') c = c.parent; return c.width || 9999; };
   const visit = (n, depth) => {
     if (n.visible === false) return;
@@ -3495,26 +3610,70 @@ function a11yAudit(root, limit) {
           const large = size >= 24 || (size >= 18.66 && weight >= 700);
           const need = large ? 3 : 4.5, aaa = large ? 4.5 : 7;
           const faded = op < 0.995;
-          items.push({ rule: A11Y_RULE.contrast, id: n.id, name: String(n.characters).slice(0, 40), kind: 'contrast', status: ratio >= need ? 'pass' : 'fail', ratio: round(ratio, 2), need: need, aaa: ratio >= aaa, large: large,
+          push({ rule: A11Y_RULE.contrast, id: n.id, name: String(n.characters).slice(0, 40), kind: 'contrast', status: ratio >= need ? 'pass' : 'fail', ratio: round(ratio, 2), need: need, aaa: ratio >= aaa, large: large,
             fg: colorHex(eff), bg: colorHex(bg.color), assumed: bg.assumed, confidence: bg.assumed ? 'assumed' : 'measured', opacity: round(op, 2), size: size,
             detail: faded ? 'Reduced to ' + Math.round(op * 100) + '% opacity by a parent layer' : '' });
-        } else items.push({ rule: A11Y_RULE.contrast, id: n.id, name: String(n.characters).slice(0, 40), kind: 'contrast', status: 'unknown', confidence: 'unknown', detail: 'Background is a ' + String(bg && bg.unknown || 'gradient/image').toLowerCase() + ' — check contrast manually' });
+        } else push({ rule: A11Y_RULE.contrast, id: n.id, name: String(n.characters).slice(0, 40), kind: 'contrast', status: 'unknown', confidence: 'unknown', detail: 'Background is a ' + String(bg && bg.unknown || 'gradient/image').toLowerCase() + ' — check contrast manually' });
       }
-      if (size < 12) items.push({ rule: A11Y_RULE.size, id: n.id, name: String(n.characters).slice(0, 40), kind: 'size', status: 'warn', confidence: 'measured', detail: 'Text is ' + round(size, 1) + 'px — under 12px is hard to read' });
+      if (size < 12) push({ rule: A11Y_RULE.size, id: n.id, name: String(n.characters).slice(0, 40), kind: 'size', status: 'warn', confidence: 'measured', detail: 'Text is ' + round(size, 1) + 'px — under 12px is hard to read' });
+      const lvl = headingLevel(size, weight);
+      if (lvl) headings.push({ level: lvl, id: n.id, name: String(n.characters).slice(0, 40), size: size });
     }
+
+    // Images need an alternative; a layer name is the only signal a plugin has.
+    if (n !== root && hasImageFill(n) && !isIconLike(n) && !inIconContext(n)) {
+      const alt = altDecision(n);
+      push({ rule: A11Y_RULE.alt, id: n.id, name: n.name, kind: 'alt', status: alt.status, confidence: 'inferred', detail: alt.detail });
+    }
+
+    // Icons and control outlines must reach 3:1 against what is behind them.
+    const iconLike = n !== root && isIconLike(n);
+    const outline = !iconLike && n !== root && isInteractive(n) && topSolid(n.strokes);
+    if (iconLike || outline) {
+      const fg = iconLike ? firstSolidPaint(n) : topSolid(n.strokes);
+      if (fg && !fg.unknown) {
+        const bg = backgroundBehind(n);
+        const op = effectiveOpacity(n);
+        if (bg && !bg.unknown && op > 0.005) {
+          const eff = blendOver(fg.color, Math.min(1, fg.alpha * op), bg.color);
+          const ratio = contrastRatio(eff, bg.color);
+          push({ rule: A11Y_RULE.nonText, id: n.id, name: n.name, kind: 'nontext', status: ratio >= 3 ? 'pass' : 'fail', ratio: round(ratio, 2), need: 3,
+            fg: colorHex(eff), bg: colorHex(bg.color), assumed: bg.assumed, confidence: bg.assumed ? 'assumed' : 'measured',
+            detail: (iconLike ? 'Icon' : 'Control outline') + ' contrast against the layer behind it' });
+        } else push({ rule: A11Y_RULE.nonText, id: n.id, name: n.name, kind: 'nontext', status: 'unknown', confidence: 'unknown', detail: 'Background is a ' + String(bg && bg.unknown || 'gradient/image').toLowerCase() + ' — check the 3:1 requirement manually' });
+      }
+    }
+
+    // A field with no visible label is unusable with a screen reader.
+    if (n !== root && /^(FRAME|INSTANCE|COMPONENT)$/.test(n.type) && FIELD_NAME_RE.test(n.name || '')) {
+      const labelled = hasVisibleText(n);
+      if (!labelled) push({ rule: A11Y_RULE.form, id: n.id, name: n.name, kind: 'form', status: 'warn', confidence: 'inferred', detail: 'Field has no visible label — pair it with a text label or a placeholder that survives' });
+      else push({ rule: A11Y_RULE.form, id: n.id, name: n.name, kind: 'form', status: 'pass', confidence: 'inferred', detail: 'Field has visible text' });
+    }
+
     if (n !== root && isInteractive(n) && 'width' in n) {
       const w = n.width, h = n.height, min = Math.min(w, h), mobile = frameWidth(n) <= 600;
-      if (min < 24) items.push({ rule: A11Y_RULE.target, id: n.id, name: n.name, kind: 'target', status: 'fail', confidence: 'measured', w: round(w), h: round(h), detail: round(w) + '×' + round(h) + ' is under the 24×24 minimum (WCAG 2.5.8)' });
-      else if (mobile && min < 44) items.push({ rule: A11Y_RULE.target, id: n.id, name: n.name, kind: 'target', status: 'warn', confidence: 'measured', w: round(w), h: round(h), detail: round(w) + '×' + round(h) + ' — aim for 44×44 on touch screens' });
-      else items.push({ rule: A11Y_RULE.target, id: n.id, name: n.name, kind: 'target', status: 'pass', confidence: 'measured', w: round(w), h: round(h), detail: round(w) + '×' + round(h) });
-      let hasText = true;
-      try { hasText = !!(n.findOne && n.findOne(x => x.type === 'TEXT' && x.visible !== false && String(x.characters || '').trim())); } catch (e) { /* assume labelled */ }
-      if (!hasText && 'children' in n) items.push({ rule: A11Y_RULE.label, id: n.id, name: n.name, kind: 'label', status: 'warn', confidence: 'inferred', detail: 'No visible text — give it an accessible name (aria-label / contentDescription)' });
+      if (min < 24) push({ rule: A11Y_RULE.target, id: n.id, name: n.name, kind: 'target', status: 'fail', confidence: 'measured', w: round(w), h: round(h), detail: round(w) + '×' + round(h) + ' is under the 24×24 minimum (WCAG 2.5.8)' });
+      else if (mobile && min < 44) push({ rule: A11Y_RULE.target, id: n.id, name: n.name, kind: 'target', status: 'warn', confidence: 'measured', w: round(w), h: round(h), detail: round(w) + '×' + round(h) + ' — aim for 44×44 on touch screens' });
+      else push({ rule: A11Y_RULE.target, id: n.id, name: n.name, kind: 'target', status: 'pass', confidence: 'measured', w: round(w), h: round(h), detail: round(w) + '×' + round(h) });
+      if (!hasVisibleText(n)) push({ rule: A11Y_RULE.label, id: n.id, name: n.name, kind: 'label', status: 'warn', confidence: 'inferred', detail: 'No visible text — give it an accessible name (aria-label / contentDescription)' });
     }
     if ('children' in n) n.children.forEach(c => visit(c, depth + 1));
   };
   visit(root, 0);
-  const counts = { fail: 0, warn: 0, pass: 0, unknown: 0 };
+
+  // Document order is the only order a screen reader sees, so a skipped level is a
+  // real navigation problem — not a cosmetic one. Levels come from the type scale.
+  let prev = 0;
+  headings.forEach(h => {
+    if (prev && h.level > prev + 1) {
+      push({ rule: A11Y_RULE.heading, id: h.id, name: h.name, kind: 'heading', status: 'warn', confidence: 'inferred',
+        detail: 'Heading levels jump from ' + prev + ' to ' + h.level + ' (' + round(h.size, 1) + 'px) — do not skip levels' });
+    }
+    prev = h.level;
+  });
+
+  const counts = { fail: 0, warn: 0, pass: 0, unknown: 0, ignored: ignoredItems.length };
   items.forEach(i => { counts[i.status]++; });
   const order = { fail: 0, warn: 1, unknown: 2, pass: 3 };
   items.sort((a, b) => order[a.status] - order[b.status]);
@@ -3525,9 +3684,9 @@ function a11yAudit(root, limit) {
   const groups = [];
   const byKey = {};
   items.forEach(it => {
-    const key = it.kind === 'contrast' && it.status !== 'unknown'
-      ? ['c', it.status, it.fg, it.bg, it.ratio, it.need, it.large ? 1 : 0, it.assumed ? 1 : 0].join('|')
-      : [it.kind, it.status, it.detail || ''].join('|');
+    const key = (it.kind === 'contrast' || it.kind === 'nontext') && it.status !== 'unknown'
+      ? [it.kind, it.status, it.fg, it.bg, it.ratio, it.need, it.large ? 1 : 0, it.assumed ? 1 : 0].join('|')
+      : [it.kind, it.status, it.detail || '', it.need || ''].join('|');
     const g = byKey[key];
     if (!g) {
       byKey[key] = { key: key, rule: it.rule, kind: it.kind, status: it.status, count: 1, ids: [it.id], item: it };
@@ -3540,7 +3699,80 @@ function a11yAudit(root, limit) {
   groups.sort((a, b) => order[a.status] - order[b.status] || b.count - a.count);
   const byRule = {};
   items.forEach(i => { byRule[i.rule] = (byRule[i.rule] || 0) + (i.status === 'fail' ? 1 : 0); });
-  return { items: items.slice(0, 120), groups: groups.slice(0, 120), counts: counts, byRule: byRule, scanned: scanned, limited: limited, depthLimited: depthLimited };
+  const ignoredGroups = {};
+  ignoredItems.forEach(i => {
+    ignoredGroups[i.id] = ignoredGroups[i.id] || { id: i.id, name: i.name, reason: i.reason, kinds: [], rules: [] };
+    ignoredGroups[i.id].kinds.push(i.kind);
+    if (ignoredGroups[i.id].rules.indexOf(i.rule) < 0) ignoredGroups[i.id].rules.push(i.rule);
+  });
+  return {
+    items: items.slice(0, 120), groups: groups.slice(0, 120), counts: counts, byRule: byRule,
+    scanned: scanned, limited: limited, depthLimited: depthLimited,
+    ignored: Object.keys(ignoredGroups).map(k => ignoredGroups[k]).slice(0, 60),
+    headingLevels: headings.slice(0, 40).map(h => h.level),
+    reasons: A11Y_REASONS
+  };
+}
+
+/** Markdown or CSV export of an audit, including the review decisions. */
+function a11yReport(audit, format, meta) {
+  const a = audit || { groups: [], counts: { fail: 0, warn: 0, pass: 0, unknown: 0, ignored: 0 }, byRule: {}, scanned: 0 };
+  const c = a.counts || {};
+  // Layer names are user data: a newline or a stray pipe would break the table.
+  const flat = v => String(v == null ? '' : v).replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const title = flat(meta && meta.name) || 'Design';
+  const when = new Date().toISOString().slice(0, 10);
+  const groups = (a.groups || []).filter(g => g.status !== 'pass');
+  if (format === 'csv') {
+    const esc = v => '"' + String(v == null ? '' : v).replace(/"/g, '""').replace(/[\r\n\t]+/g, ' ') + '"';
+    const rows = [['status', 'rule', 'kind', 'layers', 'name', 'detail'].map(esc).join(',')];
+    groups.forEach(g => rows.push([g.status, g.rule, g.kind, g.count, (g.item && g.item.name) || '', (g.item && g.item.detail) || (g.item && g.item.ratio ? g.item.ratio + ':1' : '')].map(esc).join(',')));
+    (a.ignored || []).forEach(i => rows.push(['ignored', '', i.kinds.join(' '), 1, i.name, i.reason].map(esc).join(',')));
+    return { format: 'csv', text: rows.join('\n') + '\n', file: 'devready-a11y-' + slug(title) + '.csv' };
+  }
+  const lines = [];
+  lines.push('# Accessibility report — ' + title);
+  lines.push('');
+  lines.push('Generated by DevReady on ' + when + '. WCAG 2.2 AA.');
+  lines.push('');
+  lines.push('| | Count |');
+  lines.push('|---|---|');
+  lines.push('| Failing | ' + (c.fail || 0) + ' |');
+  lines.push('| To review | ' + (c.warn || 0) + ' |');
+  lines.push('| Unmeasured | ' + (c.unknown || 0) + ' |');
+  lines.push('| Passing | ' + (c.pass || 0) + ' |');
+  lines.push('| Ignored with a reason | ' + (c.ignored || 0) + ' |');
+  lines.push('| Layers checked | ' + (a.scanned || 0) + ' |');
+  lines.push('');
+  const rules = Object.keys(A11Y_RULE_TITLE).filter(r => (a.byRule || {})[r]);
+  if (rules.length) {
+    lines.push('## By rule');
+    lines.push('');
+    lines.push('| Rule | Criterion | Failures |');
+    lines.push('|---|---|---|');
+    rules.forEach(r => lines.push('| ' + r + ' | ' + A11Y_RULE_TITLE[r] + ' | ' + a.byRule[r] + ' |'));
+    lines.push('');
+  }
+  lines.push('## Findings');
+  lines.push('');
+  if (!groups.length) lines.push('No failing or reviewable findings.');
+  groups.forEach(g => {
+    const it = g.item || {};
+    lines.push('- **' + g.status.toUpperCase() + '** · WCAG ' + (g.rule || '—') + ' · ' + g.kind + (g.count > 1 ? ' · ' + g.count + ' layers' : ''));
+    lines.push('  - ' + (flat(it.name) || 'layer') + (it.detail ? ' — ' + flat(it.detail) : ''));
+  });
+  if ((a.ignored || []).length) {
+    lines.push('');
+    lines.push('## Ignored');
+    lines.push('');
+    // The criterion stays attached to the decision, so the exemption can be audited later.
+    a.ignored.forEach(i => lines.push('- ' + (flat(i.name) || 'layer') + ' — ' + (flat(i.reason) || 'no reason given') + ' (' + i.kinds.join(', ') + ((i.rules || []).length ? ' · WCAG ' + i.rules.join(', ') : '') + ')'));
+  }
+  lines.push('');
+  lines.push('---');
+  lines.push('');
+  lines.push('Checked ' + (a.scanned || 0) + ' layers' + (a.limited ? ', stopped at the layer limit' : '') + (a.depthLimited ? ', deeper layers skipped' : '') + '. Contrast includes opacity inherited from parent layers. Backgrounds that cannot be measured are reported as unmeasured, never as a pass.');
+  return { format: 'md', text: lines.join('\n') + '\n', file: 'devready-a11y-' + slug(title) + '.md' };
 }
 
 /* ------------------------------------------------------------------ */
@@ -4474,7 +4706,7 @@ if (figma.mode === 'codegen') {
     if (my !== reqId) return;
 
     let a11y = null;
-    try { a11y = a11yAudit(node, 400); } catch (e) { /* audit is best-effort */ }
+    try { a11y = a11yAudit(node, 400, await readA11yIgnore()); } catch (e) { diag('accessibility audit', e); }
     if (my !== reqId) return;
 
     const assets = collectAssets(node, 120, settings.svgFrames);
@@ -4662,6 +4894,30 @@ if (figma.mode === 'codegen') {
             };
           });
           post({ type: 'plan', nodes: nodes, limits: RUN_LIMITS, svgFrames: settings.svgFrames });
+          break;
+        }
+        case 'a11y-ignore': {
+          const map = await readA11yIgnore();
+          msg.ids.forEach(id => { map[id] = msg.reason || 'Ignored'; });
+          const clean = writeA11yIgnore(map);
+          post({ type: 'a11y-ignored', ignored: Object.keys(clean).length });
+          figma.notify('Accessibility: ' + msg.ids.length + ' finding' + (msg.ids.length === 1 ? '' : 's') + ' ignored' + (msg.reason ? ' · ' + msg.reason : ''));
+          schedule();
+          break;
+        }
+        case 'a11y-unignore': {
+          const map = await readA11yIgnore();
+          msg.ids.forEach(id => { delete map[id]; });
+          const clean = writeA11yIgnore(map);
+          post({ type: 'a11y-ignored', ignored: Object.keys(clean).length });
+          schedule();
+          break;
+        }
+        case 'a11y-report': {
+          const node = figma.currentPage.selection[0];
+          let audit = null;
+          try { if (node) audit = a11yAudit(node, 400, await readA11yIgnore()); } catch (e) { diag('accessibility report', e); }
+          post({ type: 'a11y-report', format: msg.format, out: a11yReport(audit, msg.format, { name: node ? node.name : (figma.root.name || 'Design') }) });
           break;
         }
         case 'store-get': {

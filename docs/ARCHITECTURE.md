@@ -125,6 +125,8 @@ Message types (see `MSG_SCHEMA`): `ui-ready`, `settings`, `select`, `mark`, `exp
 | `plan` | `plan` | Complexity + illustration classification for the selection. Read-only. |
 | `cancel` | — | Marks a `jobId`; `gen-code` stops at the next layer and answers `cancelled: true`. |
 | `thumb-request` | `thumb` | A 160 px PNG for a visible row (assets, design files). |
+| `a11y-ignore` / `a11y-unignore` | `a11y-ignored` | Records or clears a review decision in the file (`devready` / `a11y-ignore`); `ids` are capped at 50 and the stored map at 120 entries / 20 kB. |
+| `a11y-report` | `a11y-report` | Re-audits the selection and answers `{ format, out: { text, file } }` for Markdown or CSV. |
 | `store-get` / `store-set` | `store` / `store-ok` / `store-error` | `clientStorage` for `projects` and `history`, JSON-validated, 200 kB cap. |
 | `gh-status` | `gh-status` | Never throws: a network failure is reported as `error.code`. |
 | `gh-connect` / `gh-disconnect` | `gh-status` | The token is stored/removed in `clientStorage`; it is never echoed back. |
@@ -177,6 +179,7 @@ bound and the tab rendering; `tests/unit-ui.js` covers the panel's pure helpers.
 | Shared plugin data (`devready` namespace) on the design | `status`, `note`, `at` | The DevReady flag, used when native status isn't available |
 | Shared plugin data on the design | `baseline:0…n`, `baseline:n`, `baselineAt` | Change-tracking snapshot, chunked under Figma's 100 kB entry limit |
 | Shared plugin data on `figma.root` | `map:<key>` | Code Connect-style component mappings |
+| Shared plugin data on `figma.root` | `a11y-ignore` | Accessibility review decisions: `{"<nodeId>": "<reason>"}`, ≤120 entries and ≤20 kB, so a file records *why* a finding was accepted |
 | Shared plugin data on canvas notes | `note`, `noteText` | The canvas-note annotation fallback |
 | `figma.clientStorage` (per user) | `devready-settings`, `font:<family>\|<key>` | Settings, uploaded font files |
 | `figma.clientStorage` (per user) | `devready-projects`, `devready-history` | Workspace: projects, design entries, revisions (≤200 kB each) |

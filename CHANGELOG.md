@@ -41,6 +41,9 @@ All notable changes to DevReady are listed here. The format follows [Keep a Chan
   when the tab is first opened, and the reply clears the pending flag.
 - **Asset and design-file thumbnails are requested, not assumed.** The panel asks only
   for the thumbnails it is about to show (8 asset rows, 12 file rows), scaled to 160 px.
+- **An ignored finding keeps its criterion.** Review decisions carry the WCAG rule
+  they exempt, so an exported report never lists a decided item without saying what
+  was decided; a newline in a layer name no longer breaks the report's list.
 - **Static HTML announces the design's language.** `lang` and `dir="rtl"` are derived from
   the actual text (Arabic, Hebrew, Devanagari, Thai, Japanese, Korean, Chinese, Cyrillic),
   instead of hard-coding `lang="en"` on every export.
@@ -103,6 +106,27 @@ All notable changes to DevReady are listed here. The format follows [Keep a Chan
 - A second hardening suite: 34 regressions for token aliases and libraries, degraded-read
   diagnostics, the snapshot budget, document language/direction and parser-level SVG
   evasion, plus direct unit tests for the panel's helpers and its ZIP writer.
+- **Accessibility 2.0 — the audit now covers the criteria a release gate needs.**
+  Alongside text contrast (1.4.3) it measures **non-text contrast** for icons and
+  control outlines at 3:1 (1.4.11, using the paint an icon actually draws with,
+  including a paint inside the icon), **image alternatives** from the layer name with
+  a decorative heuristic and an auto-name detector (1.1.1), **heading order** derived
+  from the type scale with skipped levels reported (1.3.1), and **field labels** for
+  input-like layers (3.3.2) — plus the existing target-size, tiny-text and
+  nameless-control checks. Every finding carries its WCAG reference.
+- **Review decisions that survive the file.** Ignoring a finding stores its reason
+  (`Decorative`, `Brand exception`, `Legacy design`, `False positive`,
+  `Will fix later`, `Approved by design`) in the file's shared plugin data
+  (`devready` / `a11y-ignore`), capped at 120 entries and 20 kB, so collaborators see
+  the decision instead of an unexplained pass, and it can be restored with one click.
+- **Exportable accessibility report.** The panel exports Markdown (counts, failures by
+  criterion, findings grouped by rule, the ignored list with its reasons) or CSV for a
+  spreadsheet. Layer names are flattened and CSV values escaped, so a hostile or
+  multi-line name cannot break the table. Unmeasurable backgrounds are still reported
+  as unmeasured, never as a pass.
+- A fourth suite, `tests/a11y2.js`: 7 checks covering the new rules, ignore persistence
+  and caps, both report formats, report escaping, the empty audit and the panel
+  surface (**221 checks total**).
 - A third suite, `tests/platform.js`: 21 checks covering illustration detection and
   its negative cases, end-to-end SVG assets, complexity caps, cancellation, the GitHub
   adapter (connect, reject, rate limit, permission, 404, network, retry policy, commit

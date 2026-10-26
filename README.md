@@ -9,7 +9,7 @@ Inspect specs like Dev Mode, generate real code in 12 targets, see what changed 
   <a href=".github/workflows/ci.yml"><img src="https://github.com/Ankushui18/Dev-Ready/actions/workflows/ci.yml/badge.svg" alt="Tests"></a>
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT">
   <img src="https://img.shields.io/badge/Figma-Design%20%2B%20Dev%20Mode-0d99ff" alt="Figma Design + Dev Mode">
-  <img src="https://img.shields.io/badge/tests-213%20passing-brightgreen" alt="213 checks passing">
+  <img src="https://img.shields.io/badge/tests-221%20passing-brightgreen" alt="221 checks passing">
 </p>
 
 ---
@@ -50,7 +50,7 @@ Figma's **Dev Mode** shows developers the specs of a design: sizes, spacing, col
 | **Code (12 targets)** | **React + TypeScript**, React + TypeScript + Tailwind, React + Tailwind, React + CSS, HTML + CSS, single-file HTML, Vue, Svelte, React Native, SwiftUI, Jetpack Compose, Flutter. Semantic tags, BEM classes, design tokens, real components for repeated instances — with **typed props** and ambient asset declarations in the TypeScript targets — and a project ZIP with `fonts/` + `assets/`. |
 | **Preview & compare** | Renders the generated HTML next to, or on top of, the Figma design. Difference blend mode makes mismatches visible. |
 | **Change tracking** | Lists layers that changed since handoff — size/position, style, text, name, added and removed — with **before → after** values. |
-| **Accessibility** | WCAG 2.2 contrast for every text layer, touch-target sizes, unlabelled icon buttons, text under 12px. Click a row to select the layer. |
+| **Accessibility** | WCAG 2.2 AA: text contrast, non-text contrast for icons and outlines (3:1), alt-text checks, heading order, field labels, touch-target sizes, unlabelled icon buttons, text under 12px. Click a row to select the layer, ignore it with a reason (stored in the file), or export a Markdown/CSV report. |
 | **Design tokens** | Export this layer or the whole file as CSS variables, SCSS, JSON (design-tokens format) or a Tailwind v4 `@theme`, with every variable mode. |
 | **Annotations** | Figma-native annotations with categories and pinned properties, plus a canvas-note fallback that works on every plan. |
 | **Assets & export** | Icons and images found automatically. PNG/JPG/SVG/PDF at 0.5–4x, or everything as one ZIP. |
@@ -174,7 +174,7 @@ adds six more surfaces:
 | Tab | What it is for |
 |---|---|
 | **Overview** | Current selection, layer count, depth, cost estimate, warnings, recent activity, and the project list with search, sort (recent / name / created) and archived projects. |
-| **Design** | The inspector: specs, tokens, code for 12 targets, preview, changes, accessibility. |
+| **Design** | The inspector: specs, tokens, code for 12 targets, preview, changes, accessibility (seven WCAG criteria, ignore-with-a-reason stored in the file, Markdown/CSV report). |
 | **Design Files** | The design entries of the active project. **Generate all** runs them one at a time with a progress meter; each file keeps its own status and error, and **Retry N failed** re-runs only the failures. **Cancel** stops the queue. |
 | **Code** | The files from the last successful run: name, size, per-file download, ZIP download, and shortcuts to history and publishing. |
 | **Assets** | Every icon, image and illustration on the layer. Search, filter by type, expand from 8 rows to all of them (*Show all* / *Show less*), export one or all. |
@@ -237,7 +237,7 @@ cannot fight over the same layer.
 ```bash
 npm ci
 npm run verify        # layout + Figma sandbox check + ESLint + tests (what CI runs)
-npm test              # 213 checks: 9 fixtures × 12 targets, privacy, messages, tracking,
+npm test              # 221 checks: 9 fixtures × 12 targets, privacy, messages, tracking,
                       # tsc, golden output, a real bundle of the generated React project,
                       # the tabbed workspace and the GitHub adapter (all offline)
 npm test -- --update-golden   # accept a deliberate change to generated output
@@ -272,6 +272,7 @@ Honest list — these are APIs Figma doesn't give plugins, not things we haven't
 - **Change tracking** shows before → after for position, size, fills, strokes, radius, effects, layout/padding, font and text (first 80 characters). Gradients stops and individual effect parameters are flagged by category only. It covers the first 2,500 layers of a frame, or 400,000 characters of snapshot data, whichever comes first — past that the snapshot marks itself partial rather than claiming "no changes".
 - **Illustration detection is a heuristic.** It uses names, export settings and vector density. A hand-drawn vector that looks like UI can still be exported as one SVG (switch to `named`), and a loosely named illustration may still be generated as elements (rename it, or add an SVG export setting).
 - **GitHub publishing needs a fine-grained token** with *Contents: read and write* (plus *Administration: write* to create repositories). Figma plugins have no OAuth redirect, so the token is pasted in and kept in `clientStorage`; see [docs/PUBLISHING.md](docs/PUBLISHING.md) for the full contract and the error table.
+- **The accessibility audit is a static analysis.** Text and non-text contrast, alt-text hints, heading order, field labels and target sizes come from the layers themselves. Colour-only meaning, focus-ring visibility, motion, text spacing and reflow only exist in a rendered, used interface, so the audit names them as out of scope instead of guessing. Alt text is inferred from layer names and marked *inferred* in the report; an "ignored" decision needs write access, so it is unavailable in Dev Mode (the audit still runs).
 - **Local history is local.** Projects and revisions live in `clientStorage` (200 kB per key, 20 projects, 8 revisions). They are not synced between machines and do not survive uninstalling the plugin.
 - **SwiftUI, Compose, Flutter and React Native output** is checked for structure and safe escaping, but not compiled in CI. JSX and CSS are parsed by esbuild. Native text with Figma Auto line-height uses the platform font engine's metrics; SVG baseline measurements are applied only to web CSS, where they have a direct meaning.
 - **Native annotations and native *Ready for dev*** depend on your Figma plan and seat; DevReady falls back to canvas notes and its own flag, and the UI says which one is in use.

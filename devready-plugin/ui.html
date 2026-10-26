@@ -1451,7 +1451,7 @@ const A11Y_MAX_ROWS = 25;
 function a11yRow(g) {
   const i = g.item || g;
   let lead = '<span class="a-dot ' + i.status + '"></span>', sub, meta = '';
-  if (i.kind === 'contrast' && i.status !== 'unknown') {
+  if ((i.kind === 'contrast' || i.kind === 'nontext') && i.status !== 'unknown') {
     lead = '<span class="a-sw" style="color:' + esc(i.fg) + ';background:' + esc(i.bg) + '">Aa</span>';
     sub = esc(i.fg) + ' on ' + esc(i.bg) + (i.assumed ? ' (assumed white)' : '') + (i.large ? ' \u00b7 large text' : '');
     // Faded content passes at its own colour but fails in the rendered design.
@@ -1463,25 +1463,49 @@ function a11yRow(g) {
     if (i.rule && /^[\d.]+$/.test(i.rule) && i.status !== 'pass') sub += ' \u00b7 WCAG ' + i.rule;
   }
   const many = g.count > 1 ? '<span class="a-count" title="' + g.count + ' layers have this exact problem">+' + (g.count - 1) + ' more</span>' : '';
+  // A review decision is stored per file, so an accepted finding stops being noise
+  // while the reason stays visible in the exported report.
+  const ids = (g.ids || [i.id]).join(',');
+  const ignore = i.kind === 'size' ? '' : '<button class="mini" data-act="a11y-ignore-menu" data-ids="' + esc(ids) + '" title="Ignore with a reason">Ignore</button>';
   const name = esc(i.name);
-  return '<div class="list-row a-row" data-select="' + esc(g.ids ? g.ids[0] : i.id) + '">' + lead + '<span class="ln"><span>' + name + '</span><small>' + sub + '</small></span>' + many + meta + '</div>';
+  return '<div class="list-row a-row" data-select="' + esc(g.ids ? g.ids[0] : i.id) + '">' + lead + '<span class="ln"><span>' + name + '</span><small>' + sub + '</small></span>' + many + meta + ignore + '</div>';
 }
+const A11Y_FALLBACK_REASONS = ['Decorative', 'Brand exception', 'Legacy design', 'False positive', 'Will fix later', 'Approved by design'];
+/** Rules the audit can report, so the section can explain itself without the docs. */
+const A11Y_KIND_LABEL = { contrast: 'Text contrast', nontext: 'Non-text contrast', alt: 'Image alt text', heading: 'Heading order', form: 'Field label', target: 'Target size', label: 'Accessible name', size: 'Readability' };
 function secA11y(d) {
   const a = d.a11y;
   if (!a || !a.items || !a.items.length) return '';
   const c = a.counts;
   const groups = a.groups && a.groups.length ? a.groups : a.items.map(i => ({ kind: i.kind, status: i.status, count: 1, ids: [i.id], item: i }));
   const issues = groups.filter(g => g.status !== 'pass');
+  const ignored = a.ignored || [];
   const pills = '<div class="a-sum">' +
     (c.fail ? '<span class="pill bad"><i></i>' + c.fail + ' failing</span>' : '') + (c.warn ? '<span class="pill warn"><i></i>' + c.warn + ' to review</span>' : '') +
-    (c.unknown ? '<span class="pill"><i></i>' + c.unknown + ' unmeasured</span>' : '') + (c.pass ? '<span class="pill ok"><i></i>' + c.pass + ' passing</span>' : '') + '</div>';
+    (c.unknown ? '<span class="pill"><i></i>' + c.unknown + ' unmeasured</span>' : '') + (c.pass ? '<span class="pill ok"><i></i>' + c.pass + ' passing</span>' : '') +
+    (ignored.length ? '<span class="pill"><i></i>' + ignored.length + ' ignored</span>' : '') + '</div>';
+  const kinds = {};
+  issues.forEach(g => { kinds[g.kind] = (kinds[g.kind] || 0) + g.count; });
+  const kindLine = Object.keys(kinds).length
+    ? '<div class="faint" style="padding:2px 0 4px">' + Object.keys(kinds).map(k => kinds[k] + ' \u00d7 ' + (A11Y_KIND_LABEL[k] || k)).join(' \u00b7 ') + '</div>'
+    : '';
   const shown = (S.a11yAll ? groups : issues);
   const capped = shown.slice(0, S.a11yMore ? shown.length : A11Y_MAX_ROWS);
   const rows = capped.map(a11yRow).join('');
   const more = shown.length > capped.length ? '<button class="mini" data-act="a11y-more" style="margin-top:4px">Show ' + (shown.length - capped.length) + ' more</button>' : '';
   const toggle = c.pass ? '<button class="mini" data-act="a11y-all" style="margin-top:4px">' + (S.a11yAll ? 'Show only issues' : 'Show ' + c.pass + ' passing') + '</button>' : '';
-  const empty = !issues.length && !S.a11yAll ? '<div class="muted" style="padding:2px 0 4px">No contrast or touch-target problems found in this layer.</div>' : '';
-  return sec('Accessibility', '', pills + rows + more + empty + toggle + '<div class="faint" style="margin-top:6px">WCAG 2.2 AA: text 4.5:1 (3:1 for large text), targets 24\u00d724 (44\u00d744 recommended on touch). Checked ' + a.scanned + ' layers' + (a.limited ? ' (stopped at the layer limit)' : '') + (a.depthLimited ? ' (deeper layers skipped)' : '') + '. Opacity from parent layers is included. Backgrounds that can\u2019t be measured are reported as unmeasured, never as a pass.</div>', c.fail + c.warn);
+  const empty = !issues.length && !S.a11yAll ? '<div class="muted" style="padding:2px 0 4px">No contrast, non-text, alt-text, heading, label or touch-target problems found in this layer.</div>' : '';
+  const ignoredBlock = ignored.length ? (
+    '<div style="margin-top:6px">' +
+    '<button class="mini" data-act="a11y-ignored">' + (S.a11yIgnored ? 'Hide' : 'Show') + ' ' + ignored.length + ' ignored</button>' +
+    (S.a11yIgnored ? ignored.map(i => '<div class="list-row"><span class="ln"><span>' + esc(i.name) + '</span><small>' + esc(i.reason) + ' \u00b7 ' + esc((i.kinds || []).map(k => A11Y_KIND_LABEL[k] || k).join(', ')) + '</small></span>' +
+      '<button class="mini" data-act="a11y-unignore" data-ids="' + esc(i.id) + '">Unignore</button></div>').join('') : '') +
+    '</div>') : '';
+  const report = '<div class="row" style="margin-top:6px;gap:6px">' +
+    '<button class="mini" data-act="a11y-report-md" title="Markdown report with counts, findings and review decisions">Export report</button>' +
+    '<button class="mini" data-act="a11y-report-csv" title="CSV for a spreadsheet">CSV</button></div>';
+  return sec('Accessibility', '', pills + kindLine + rows + more + empty + toggle + ignoredBlock + report +
+    '<div class="faint" style="margin-top:6px">WCAG 2.2 AA: text 4.5:1 (3:1 for large text), icons and outlines 3:1, targets 24\u00d724 (44\u00d744 on touch). Checked ' + a.scanned + ' layers' + (a.limited ? ' (stopped at the layer limit)' : '') + (a.depthLimited ? ' (deeper layers skipped)' : '') + '. Opacity from parent layers is included. Backgrounds that can\u2019t be measured are reported as unmeasured, never as a pass. Ignoring a finding stores the reason in the file, so collaborators see the decision.</div>', c.fail + c.warn);
 }
 
 /* ---------- Design tokens export ---------- */
@@ -1573,6 +1597,13 @@ function menuFor(act, el) {
     ]);
     return;
   }
+  if (act === 'a11y-ignore-menu') {
+    const ids = String(el.getAttribute('data-ids') || '').split(',').filter(Boolean);
+    if (!ids.length) return;
+    const reasons = (S.data && S.data.a11y && S.data.a11y.reasons) || A11Y_FALLBACK_REASONS;
+    openMenu(el, reasons.map(r => ({ label: r, run: () => send({ type: 'a11y-ignore', ids: ids, reason: r }) })));
+    return;
+  }
   if (act === 'assets-menu') {
     openMenu(el, [
       { label: S.assetsView.all ? 'Show fewer assets' : 'Show all assets', run: () => { S.assetsView.all = !S.assetsView.all; render(); } },
@@ -1644,6 +1675,13 @@ document.addEventListener('click', e => {
   if (act === 'sec-toggle') { const k = a.getAttribute('data-key'); S.closed[k] = !S.closed[k]; render(); return; }
   if (act === 'a11y-all') { S.a11yAll = !S.a11yAll; S.a11yMore = false; render(); return; }
   if (act === 'a11y-more') { S.a11yMore = !S.a11yMore; render(); return; }
+  if (act === 'a11y-ignored') { S.a11yIgnored = !S.a11yIgnored; render(); return; }
+  if (act === 'a11y-unignore') { send({ type: 'a11y-unignore', ids: String(a.getAttribute('data-ids') || '').split(',').filter(Boolean) }); return; }
+  if (act === 'a11y-report-md' || act === 'a11y-report-csv') {
+    send({ type: 'a11y-report', format: act === 'a11y-report-csv' ? 'csv' : 'md' });
+    toast('Building the report…');
+    return;
+  }
   if (/^tok-scope-/.test(act)) { S.tok.scope = act.slice(10); S.tok.out = null; render(); return; }
   if (act === 'tok-gen') {
     if (S.demo) { S.tok.out = Object.assign({ format: S.tok.format, scope: S.tok.scope }, DEMO_TOKENS[S.tok.format]); render(); return; }
@@ -2640,7 +2678,8 @@ window.onmessage = ev => {
   if (ev.source && window.parent && ev.source !== window.parent) return;
   const m = ev.data && ev.data.pluginMessage; if (!m) return;
   if (['loading', 'state', 'code', 'download', 'error', 'thumb', 'project', 'design-shot', 'fonts-updated', 'ann-result', 'tokens',
-    'plan', 'store', 'store-ok', 'store-error', 'gh-status', 'gh-repos', 'gh-branches', 'gh-created', 'gh-tree', 'gh-committed'].indexOf(m.type) === -1) return;
+    'plan', 'store', 'store-ok', 'store-error', 'gh-status', 'gh-repos', 'gh-branches', 'gh-created', 'gh-tree', 'gh-committed',
+    'a11y-report', 'a11y-ignored'].indexOf(m.type) === -1) return;
   S.got = true; S.demo = false;
   if (m.type === 'loading') $('bar').classList.add('on');
   else if (m.type === 'state') {
@@ -2669,6 +2708,15 @@ window.onmessage = ev => {
     }
     render();
     if (m.out.assetErrors && m.out.assetErrors.length) toast(m.out.assetErrors.length + ' asset export issue' + (m.out.assetErrors.length === 1 ? '' : 's') + ' — retry in Figma before downloading');
+  }
+  else if (m.type === 'a11y-report') {
+    if (m.out) {
+      download(m.out.file, new TextEncoder().encode(m.out.text), 'text/plain');
+      toast('Downloaded ' + m.out.file);
+    }
+  }
+  else if (m.type === 'a11y-ignored') {
+    toast(m.ignored + ' review decision' + (m.ignored === 1 ? '' : 's') + ' stored with this file');
   }
   else if (m.type === 'tokens') { S.tok = S.tok || { format: m.format, scope: m.scope }; S.tok.busy = false; S.tok.diag = m.diagnostics || []; S.tok.out = Object.assign({ format: m.format, scope: m.scope }, m.out); render(); }
   else if (m.type === 'fonts-updated') { S.code = {}; pending = {}; render(); }
@@ -2792,12 +2840,32 @@ const DEMO = {
     { id: null, name: 'Promo banner', kind: 'removed', parts: [] }] },
   css: '/* Auto layout */\ndisplay: flex;\npadding: 12px 24px;\njustify-content: center;\nalign-items: center;\ngap: var(--space-200, 8px);\n\n/* Layout */\nalign-self: stretch;\n\n/* Style */\nborder-radius: var(--radius-300, 12px);\nbackground: var(--brand-primary, #0D99FF);\nbox-shadow: 0 4px 12px 0 rgba(13, 153, 255, 0.25);',
   tailwind: 'flex px-6 py-3 justify-center items-center gap-[var(--space-200,8px)] self-stretch rounded-[var(--radius-300,12px)] bg-[var(--brand-primary,#0D99FF)] shadow-[0_4px_12px_0_rgba(13,153,255,0.25)]',
-  a11y: { scanned: 12, limited: false, depthLimited: false, counts: { fail: 2, warn: 2, pass: 3, unknown: 0 }, byRule: { '1.4.3': 2, '2.5.8': 0, '4.1.2': 0 }, items: [
-    { rule: '1.4.3', id: '1:23', name: 'Pay \u20b91,499', kind: 'contrast', status: 'fail', ratio: 3.02, need: 4.5, aaa: false, large: false, fg: '#7BC4FF', bg: '#0D99FF', assumed: false, confidence: 'measured', opacity: 1, size: 14 },
-    { rule: '1.4.3', id: '1:30', name: 'Promo terms', kind: 'contrast', status: 'fail', ratio: 2.48, need: 4.5, aaa: false, large: false, fg: '#9CA3AF', bg: '#FFFFFF', assumed: true, confidence: 'assumed', opacity: 0.6, size: 12 },
-    { rule: '2.5.8', id: '1:20', name: 'Pay button', kind: 'target', status: 'warn', detail: '327\u00d740 \u2014 aim for 44\u00d744 on touch screens' },
-    { rule: '4.1.2', id: '1:31', name: 'Close', kind: 'label', status: 'warn', detail: 'No visible text \u2014 give it an accessible name (aria-label / contentDescription)' },
-    { rule: '1.4.3', id: '1:25', name: 'Subtotal', kind: 'contrast', status: 'pass', ratio: 12.63, need: 4.5, aaa: true, large: false, fg: '#111827', bg: '#FFFFFF', assumed: false, confidence: 'measured', opacity: 1, size: 14 }] },
+  a11y: { scanned: 14, limited: false, depthLimited: false,
+    counts: { fail: 4, warn: 5, pass: 2, unknown: 0, ignored: 1 },
+    byRule: { '1.4.3': 2, '1.4.11': 2, '2.5.8': 0, '4.1.2': 0, '1.1.1': 0, '1.3.1': 0, '3.3.2': 0 },
+    headingLevels: [1, 3],
+    reasons: ['Decorative', 'Brand exception', 'Legacy design', 'False positive', 'Will fix later', 'Approved by design'],
+    items: [
+      { rule: '1.4.3', id: '1:23', name: 'Pay \u20b91,499', kind: 'contrast', status: 'fail', ratio: 3.02, need: 4.5, aaa: false, large: false, fg: '#7BC4FF', bg: '#0D99FF', assumed: false, confidence: 'measured', opacity: 1, size: 14 },
+      { rule: '1.4.3', id: '1:30', name: 'Promo terms', kind: 'contrast', status: 'fail', ratio: 2.48, need: 4.5, aaa: false, large: false, fg: '#9CA3AF', bg: '#FFFFFF', assumed: true, confidence: 'assumed', opacity: 0.6, size: 12 },
+      { rule: '1.4.11', id: '1:21', name: 'icon/lock', kind: 'nontext', status: 'fail', ratio: 1.68, need: 3, fg: '#D4D4D8', bg: '#FFFFFF', assumed: false, confidence: 'measured', detail: 'Icon contrast against the layer behind it' },
+      { rule: '1.4.11', id: '1:22', name: 'icon/arrow-right', kind: 'nontext', status: 'fail', ratio: 1.68, need: 3, fg: '#D4D4D8', bg: '#FFFFFF', assumed: false, confidence: 'measured', detail: 'Icon contrast against the layer behind it' },
+      { rule: '1.1.1', id: '1:26', name: 'Rectangle 26', kind: 'alt', status: 'warn', confidence: 'inferred', detail: 'Layer name "Rectangle 26" is auto-generated \u2014 rename it to describe the image, or mark it decorative' },
+      { rule: '1.3.1', id: '1:27', name: 'Promo headline', kind: 'heading', status: 'warn', confidence: 'inferred', detail: 'Heading levels jump from 1 to 3 (20px) \u2014 do not skip levels' },
+      { rule: '3.3.2', id: '1:28', name: 'Email input', kind: 'form', status: 'warn', confidence: 'inferred', detail: 'Field has no visible label \u2014 pair it with a text label or a placeholder that survives' },
+      { rule: '2.5.8', id: '1:20', name: 'Pay button', kind: 'target', status: 'warn', confidence: 'measured', w: 327, h: 40, detail: '327\u00d740 \u2014 aim for 44\u00d744 on touch screens' },
+      { rule: '4.1.2', id: '1:31', name: 'Close', kind: 'label', status: 'warn', confidence: 'inferred', detail: 'No visible text \u2014 give it an accessible name (aria-label / contentDescription)' },
+      { rule: '1.4.3', id: '1:25', name: 'Subtotal', kind: 'contrast', status: 'pass', ratio: 12.63, need: 4.5, aaa: true, large: false, fg: '#111827', bg: '#FFFFFF', assumed: false, confidence: 'measured', opacity: 1, size: 14 }],
+    groups: [
+      { key: 'contrast|fail', rule: '1.4.3', kind: 'contrast', status: 'fail', count: 2, ids: ['1:23', '1:30'], item: { rule: '1.4.3', id: '1:23', name: 'Pay \u20b91,499', kind: 'contrast', status: 'fail', ratio: 3.02, need: 4.5, aaa: false, large: false, fg: '#7BC4FF', bg: '#0D99FF', assumed: false, opacity: 1, size: 14 } },
+      { key: 'nontext|fail', rule: '1.4.11', kind: 'nontext', status: 'fail', count: 2, ids: ['1:21', '1:22'], item: { rule: '1.4.11', id: '1:21', name: 'icon/lock', kind: 'nontext', status: 'fail', ratio: 1.68, need: 3, fg: '#D4D4D8', bg: '#FFFFFF', assumed: false, detail: 'Icon contrast against the layer behind it' } },
+      { key: 'alt|warn', rule: '1.1.1', kind: 'alt', status: 'warn', count: 1, ids: ['1:26'], item: { rule: '1.1.1', id: '1:26', name: 'Rectangle 26', kind: 'alt', status: 'warn', detail: 'Layer name "Rectangle 26" is auto-generated \u2014 rename it to describe the image, or mark it decorative' } },
+      { key: 'heading|warn', rule: '1.3.1', kind: 'heading', status: 'warn', count: 1, ids: ['1:27'], item: { rule: '1.3.1', id: '1:27', name: 'Promo headline', kind: 'heading', status: 'warn', detail: 'Heading levels jump from 1 to 3 (20px) \u2014 do not skip levels' } },
+      { key: 'form|warn', rule: '3.3.2', kind: 'form', status: 'warn', count: 1, ids: ['1:28'], item: { rule: '3.3.2', id: '1:28', name: 'Email input', kind: 'form', status: 'warn', detail: 'Field has no visible label \u2014 pair it with a text label or a placeholder that survives' } },
+      { key: 'target|warn', rule: '2.5.8', kind: 'target', status: 'warn', count: 1, ids: ['1:20'], item: { rule: '2.5.8', id: '1:20', name: 'Pay button', kind: 'target', status: 'warn', detail: '327\u00d740 \u2014 aim for 44\u00d744 on touch screens' } },
+      { key: 'label|warn', rule: '4.1.2', kind: 'label', status: 'warn', count: 1, ids: ['1:31'], item: { rule: '4.1.2', id: '1:31', name: 'Close', kind: 'label', status: 'warn', detail: 'No visible text \u2014 give it an accessible name (aria-label / contentDescription)' } },
+      { key: 'contrast|pass', rule: '1.4.3', kind: 'contrast', status: 'pass', count: 2, ids: ['1:25', '1:29'], item: { rule: '1.4.3', id: '1:25', name: 'Subtotal', kind: 'contrast', status: 'pass', ratio: 12.63, need: 4.5, aaa: true, large: false, fg: '#111827', bg: '#FFFFFF', assumed: false, opacity: 1, size: 14 } }],
+    ignored: [{ id: '1:34', name: 'Promo blob', reason: 'Decorative', kinds: ['nontext'], rules: ['1.4.11'] }] },
   measure: { mode: 'inset', outer: 'Checkout / Mobile', inner: 'Button', top: 712, right: 24, bottom: 52, left: 24, segments: [] },
   assets: [{ id: '1:20', name: 'Pay button', type: 'INSTANCE', kind: 'selection', w: 327, h: 48 }, { id: '1:21', name: 'icon/lock', type: 'INSTANCE', kind: 'icon', w: 20, h: 20 }, { id: '1:22', name: 'icon/arrow-right', type: 'INSTANCE', kind: 'icon', w: 20, h: 20 }]
 };
