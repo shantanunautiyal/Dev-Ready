@@ -9,7 +9,7 @@ Inspect specs like Dev Mode, generate real code in 12 targets, see what changed 
   <a href=".github/workflows/ci.yml"><img src="https://github.com/Ankushui18/Dev-Ready/actions/workflows/ci.yml/badge.svg" alt="Tests"></a>
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT">
   <img src="https://img.shields.io/badge/Figma-Design%20%2B%20Dev%20Mode-0d99ff" alt="Figma Design + Dev Mode">
-  <img src="https://img.shields.io/badge/tests-158%20passing-brightgreen" alt="158 checks passing">
+  <img src="https://img.shields.io/badge/tests-192%20passing-brightgreen" alt="192 checks passing">
 </p>
 
 ---
@@ -26,10 +26,11 @@ DevReady is a **Figma plugin**, not a website. Pick the path that matches you:
 | **Understand or change the code** | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — map of `code.js` and `ui.html` |
 | **Run the tests / contribute** | [CONTRIBUTING.md](CONTRIBUTING.md) · [Quality](#quality) |
 | **See what's missing** (honest list) | [Known limits](#known-limits) |
+| **Plan the next release** | [docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md) — findings, features, edge cases, test plan |
 | **Publish it to Figma Community** | [docs/LAUNCH.md](docs/LAUNCH.md) |
 | **Fix the repo if files were uploaded to the wrong place** | [docs/GITHUB_SETUP.md](docs/GITHUB_SETUP.md) |
 
-> **Status: v1.2.0, local development plugin.** It is not on Figma Community yet, so you install it from this repo (below). Everything runs inside Figma — no account, no server, no tracking.
+> **Status: v1.5.1, local development plugin.** It is not on Figma Community yet, so you install it from this repo (below). Everything runs inside Figma — no account, no server, no tracking.
 
 ---
 
@@ -142,6 +143,7 @@ Dev-Ready/
 │   ├── LAUNCH.md              Figma Community checklist + manual test matrix
 │   ├── GITHUB_SETUP.md        repo settings, upload mistakes, releases
 │   ├── NAMING.md              name options and what to rename if you pick one
+│   ├── IMPROVEMENTS.md        review: findings, feature roadmap, edge cases, test plan
 │   ├── test-report.md         latest test results
 │   ├── screenshots/           images used above
 │   └── brand/                 icon, cover, social preview
@@ -162,7 +164,7 @@ Dev-Ready/
 ```bash
 npm ci
 npm run verify        # layout + Figma sandbox check + ESLint + tests (what CI runs)
-npm test              # 158 checks: 9 fixtures × 12 targets, privacy, messages, tracking,
+npm test              # 192 checks: 9 fixtures × 12 targets, privacy, messages, tracking,
                       # tsc, golden output, and a real bundle of the generated React project
 npm test -- --update-golden   # accept a deliberate change to generated output
 npm run lint          # ESLint, including the script inside ui.html

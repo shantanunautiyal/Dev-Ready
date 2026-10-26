@@ -512,9 +512,9 @@
   <div id="demo" class="demo" style="display:none">Preview · sample data — run inside Figma for live inspection</div>
   <div id="hdr" class="hdr"></div>
   <div id="bar" class="bar"></div>
-  <main id="main"></main>
-  <div id="menu" class="menu"></div>
-  <div id="toast" class="toast"></div>
+  <main id="main" aria-label="DevReady inspection"></main>
+  <div id="menu" class="menu" role="menu" aria-label="DevReady menu"></div>
+  <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
   <input type="file" id="font-file" multiple accept=".woff2,.woff,.ttf,.otf" style="display:none" />
   <svg id="resize" class="resize" viewBox="0 0 12 12"><path d="M11 4L4 11M11 8l-3 3" stroke="currentColor"/></svg>
 
@@ -522,7 +522,7 @@
 /* ===================================================================
  * DevReady Inspect — UI (Figma Dev Mode style)
  * =================================================================== */
-const S = { view: 'code', cmp: 'preview', opacity: 50, diff: false, shot: null, data: null, lang: 'css', file: '', code: {}, codeFor: null, assetFmt: 'SVG:1', thumbs: {}, demo: false, got: false };
+const S = { view: 'code', cmp: 'preview', opacity: 50, diff: false, shot: null, data: null, lang: 'css', file: '', code: {}, codeFor: null, assetFmt: 'SVG:1', thumbs: {}, demo: false, got: false, codeError: {}, pvDoc: '' };
 const $ = id => document.getElementById(id);
 const esc = s => String(s === undefined || s === null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const r2 = n => typeof n === 'number' ? Math.round(n * 100) / 100 : n;
@@ -743,10 +743,28 @@ function renderInspect(d) {
   $('main').innerHTML = [
     secOverrides(sp), secResources(sp), secCodeConnect(sp), secChanges(d), secComponent(sp), secRecommended(sp), secAnnotations(d),
     secCode(d), d.count === 2 ? secSpacing(d) : '', secLayerProps(d), secTypography(sp), secColors(sp), secEffects(sp), secA11y(d),
-    secVariables(sp), secTokens(d, false), secContent(sp), secInteractions(sp), secLayers(sp), secAssets(d), secExport(d)
+    secVariables(sp), secTokens(d, false), secContent(sp), secInteractions(sp), secLayers(sp), secAssets(d), secExport(d),
+    secDiagnostics(d)
   ].join('');
-  const f = document.querySelector('.form [autofocus]'); if (f && S.focusForm) { f.focus(); S.focusForm = false; }
+  const f = document.querySelector('.form [autofocus]'); if (f && S.focusForm) { f.focus(); S.focusForm = false; S._autoFocus = true; }
   mountPreview();
+}
+
+/* Notes for reads that failed during one export (tokens, code). */
+function diagNote(list) {
+  if (!list || !list.length) return '';
+  return '<div class="warn" style="margin-bottom:6px">Some Figma data could not be read: ' + esc(list.map(d => d.where).join(', ')) +
+    '. The export below may be incomplete.</div>';
+}
+/* (Z) degraded reads — an engine call that failed is reported, never hidden */
+function secDiagnostics(d) {
+  const list = d && d.diagnostics;
+  if (!list || !list.length) return '';
+  return sec('Limited data', '',
+    '<div class="warn" style="margin-bottom:6px">Figma refused or does not support some reads on this file, so parts of this panel may be incomplete.</div>' +
+    list.map(x => '<div class="list-row dead" title="' + esc(x.detail || '') + '"><span class="ico" style="color:var(--amber, #B26B00)">' + I.info + '</span><span class="ln">' + esc(x.where) + '</span>' +
+      (x.detail ? '<span class="faint" style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(x.detail) + '</span>' : '') + '</div>').join(''),
+    list.length);
 }
 
 /* (B) instance vs main component */
@@ -768,11 +786,13 @@ function secOverrides(sp) {
 }
 
 /* (C) dev resources */
+function host(u) { try { return String(new URL(u)).replace(/^https?:\/\//, '').replace(/\/.*$/, ''); } catch (e) { return ''; } }
 function resIcon(u) { return /github\.com|gitlab|bitbucket/.test(u) ? I.github : /storybook|chromatic/.test(u) ? I.storybook : /atlassian|jira|linear\.app/.test(u) ? I.ticket : I.link; }
 function secResources(sp) {
   const list = sp.devResources || [];
-  let b = list.map(r => '<div class="res-row"><span class="ri">' + resIcon(r.url) + '</span><a class="ln" href="' + esc(r.url) + '" target="_blank" rel="noopener">' + esc(r.name || r.url) + '</a>' +
-    '<button class="ibtn x" data-act="res-del" data-url="' + esc(r.url) + '" title="Remove link">' + I.x + '</button><a class="ibtn" href="' + esc(r.url) + '" target="_blank" rel="noopener" title="Open">' + I.ext + '</a></div>').join('');
+  let b = list.map(r => '<div class="res-row"><span class="ri">' + resIcon(r.url) + '</span><a class="ln" href="' + esc(r.url) + '" target="_blank" rel="noopener noreferrer" title="' + esc(r.url) + '">' + esc(r.name || r.url) + '</a>' +
+    (host(r.url) ? '<span class="src-b" title="Link destination">' + esc(host(r.url)) + '</span>' : '') +
+    '<button class="ibtn x" data-act="res-del" data-url="' + esc(r.url) + '" title="Remove link">' + I.x + '</button><a class="ibtn" href="' + esc(r.url) + '" target="_blank" rel="noopener noreferrer" title="Open ' + esc(host(r.url)) + '">' + I.ext + '</a></div>').join('');
   if (S.form === 'res') {b += '<div class="form"><input class="in" id="res-url" autofocus placeholder="https://github.com/org/repo/blob/main/Button.tsx"><input class="in" id="res-name" placeholder="Name (optional), e.g. Notification - Storybook">' +
     '<div class="row"><button class="btn" data-act="form-cancel">Cancel</button><button class="btn blue" data-act="res-add">Add link</button></div></div>';}
   if (!list.length && S.form !== 'res') b = '<div class="faint">Link GitHub, Storybook, Jira or docs · <span class="mini" data-act="form-res">Add link</span></div>';
@@ -1021,7 +1041,47 @@ function secExport(d) {
 /* ===================================================================
  * Render
  * =================================================================== */
+/* ---------- view state: a node edit must not move the page under the user ---------- */
+function viewState() {
+  const main = $('main');
+  const out = { top: main ? main.scrollTop : 0, focus: null };
+  const a = document.activeElement;
+  if (!a || a === document.body || a === main) return out;
+  if (a.id) out.focus = { id: a.id, s: a.selectionStart, e: a.selectionEnd };
+  else if (a.getAttribute && a.getAttribute('data-act')) {
+    out.focus = { act: a.getAttribute('data-act'), key: a.getAttribute('data-key') || '', idx: a.getAttribute('data-idx') || '' };
+  }
+  return out;
+}
+function restoreView(v) {
+  const main = $('main');
+  if (main && v.top) main.scrollTop = v.top;
+  const f = v.focus;
+  // A freshly opened form owns focus; don't steal it back to the trigger.
+  if (!f || S._autoFocus) return;
+  let el;
+  if (f.id) el = document.getElementById(f.id);
+  else {
+    const list = Array.from(document.querySelectorAll('#main [data-act="' + String(f.act).replace(/"/g, '') + '"]'));
+    el = list.find(x => (x.getAttribute('data-key') || '') === f.key && (x.getAttribute('data-idx') || '') === f.idx) || list[0] || null;
+  }
+  if (!el || !el.focus) return;
+  try { el.focus({ preventScroll: true }); } catch (e) { try { el.focus(); } catch (e2) { /* ignore */ } }
+  if (typeof f.s === 'number' && el.setSelectionRange) { try { el.setSelectionRange(f.s, f.e); } catch (e) { /* not a text field */ } }
+}
+/** Icon-only controls need names; decorative SVGs must not be announced. */
+function a11yDom() {
+  document.querySelectorAll('#hdr svg, #main svg, #bar svg, #menu svg').forEach(s => { s.setAttribute('aria-hidden', 'true'); s.setAttribute('focusable', 'false'); });
+  document.querySelectorAll('button.ibtn[title], a.ibtn[title]').forEach(b => { if (!b.getAttribute('aria-label')) b.setAttribute('aria-label', b.getAttribute('title')); });
+  document.querySelectorAll('#main .sec-t').forEach(b => { const sec = b.closest('.sec'); if (sec) b.setAttribute('aria-expanded', String(!sec.classList.contains('closed'))); });
+  document.querySelectorAll('#main .sec').forEach(sec => { if (!sec.getAttribute('aria-label')) { const t = sec.querySelector('.sec-t'); if (t) sec.setAttribute('aria-label', t.textContent.trim()); } });
+}
 function render() {
+  const v = viewState();
+  S._autoFocus = false;
+  try { renderNow(); } finally { a11yDom(); restoreView(v); S._autoFocus = false; }
+}
+function renderNow() {
   $('demo').style.display = S.demo ? 'block' : 'none';
   const d = S.data;
   if (!d) { $('hdr').innerHTML = '<div class="hdr-row"><div class="name">DevReady</div></div>'; $('main').innerHTML = ''; return; }
@@ -1066,12 +1126,16 @@ function renderLocked(d) {
       '<div class="list-row" data-select="' + esc(d.target.id) + '" style="margin-bottom:6px"><span class="ico">' + typeIcon(d.target.type) + '</span><span class="ln">' + esc(d.target.name) + '</span></div>' +
       '<textarea id="note" placeholder="Add a note for developers (optional)"></textarea>' +
       '<div class="row-btns"><button class="btn green full" data-act="mark" data-status="READY_FOR_DEV">' + I.ready + (d.isDev ? 'Flag as ready for dev' : 'Mark as ready for dev') + '</button></div>' +
-      '<div class="faint" style="margin-top:6px">' + (d.isDev ? 'Dev Mode is read-only, so this saves a DevReady flag (shared plugin data).' : 'Uses Figma’s native status when your plan allows it, otherwise a DevReady flag.') + '</div>');
+      '<div class="faint" style="margin-top:6px">' + (d.isDev
+        ? 'Dev Mode is read-only, so this saves a DevReady flag (shared plugin data). It still unlocks the panel for everyone on the file.'
+        : (d.target.native
+          ? 'Sets Figma’s native Ready for dev status and mirrors a DevReady flag, so teammates on free plans unlock it too.'
+          : 'This layer type can’t hold a Figma status, so DevReady saves its own flag — it works on every plan.')) + '</div>');
   }
   $('main').innerHTML =
     '<div class="empty"><div class="em-ico">' + I.lock + '</div><h3>Not ready for dev</h3><p>This layer isn’t inside a frame, component or section marked ready for dev, so specs, code and assets are hidden.</p>' +
     '<div class="row-btns" style="justify-content:center"><button class="btn" data-act="gate-off">Inspect anyway</button></div>' +
-    '<p class="faint" style="margin-top:10px">The gate is an optional team workflow. “Inspect anyway” turns it off for you on this device (⋯ → Dev-ready gate turns it back on). Status comes from Figma’s Ready for dev or, where that isn’t available, a DevReady flag.</p></div>' +
+    '<p class="faint" style="margin-top:10px">The gate is an optional team workflow. “Inspect anyway” turns it off <b>for you, on this device</b>, for every design — turn it back on from ⋯ → Dev-ready gate. Status comes from Figma’s Ready for dev or, where that isn’t available, a DevReady flag.</p></div>' +
     hand + sec('Ready for dev', '', readyRows(d.ready), d.ready ? d.ready.length : 0);
 }
 
@@ -1088,7 +1152,10 @@ function secChanges(d) {
   // Say where the snapshot lives: it is shared plugin data, not private state.
   const stored = '<div class="faint" style="margin-top:6px">' + I.info + 'The snapshot is stored <b>in this Figma file</b>, so anyone with edit access — and other plugins — can read it. It holds layer ids, the first 40 characters of layer names, colours, sizes and the first 80 characters of text. No images. <b>Clear</b> deletes it.</div>';
   if (c.none) return sec('Changes', '', '<div class="muted" style="margin-bottom:8px">This design was marked ready before change tracking was on. Save a snapshot to see future edits here.</div>' + save);
-  if (!c.count) return sec('Changes', clear, '<div class="list-row dead"><span class="ico" style="color:var(--green)">' + I.check + '</span><span class="ln muted">No changes' + (c.partial ? ' in the first ' + (c.limit || 2500).toLocaleString() + ' layers' : '') + ' since ready for dev · ' + esc(fmtDate(c.at)) + '</span></div>' + stored);
+  if (!c.count) {
+    const partialNote = '<div class="warn" style="margin-bottom:6px">Only the first ' + (c.limit || 2500).toLocaleString() + ' layers are compared. No edits were found in them, but layers beyond the limit — including added or removed ones — were not checked.</div>';
+    return sec('Changes', clear, (c.partial ? partialNote : '') + '<div class="list-row dead"><span class="ico" style="color:var(--green)">' + I.check + '</span><span class="ln muted">No changes' + (c.partial ? ' in the first ' + (c.limit || 2500).toLocaleString() + ' layers' : '') + ' since ready for dev · ' + esc(fmtDate(c.at)) + '</span></div>' + stored);
+  }
   const sw = v => { const m = /^#[0-9A-F]{6,8}/.exec(v); return m ? '<i class="chg-sw" style="background:' + m[0] + '"></i>' : ''; };
   const det = x => (x.detail && x.detail.length) ? '<div class="chg-det">' + x.detail.map(d => '<div class="chg-line"><span class="chg-p">' + esc(d.prop) + '</span><span class="chg-b" title="' + esc(d.before) + '">' + sw(d.before) + esc(d.before) + '</span><span class="chg-a">→</span><span class="chg-n" title="' + esc(d.after) + '">' + sw(d.after) + esc(d.after) + '</span></div>').join('') + '</div>' : '';
   const rows = c.changes.map(x => '<div class="chg"><div class="list-row' + (x.id ? '' : ' dead') + '"' + (x.id ? ' data-select="' + esc(x.id) + '"' : '') + '><span class="kb ' + x.kind + '">' + x.kind + '</span><span class="ln">' + esc(x.name) + '</span><span class="faint">' + esc(x.parts.join(', ')) + '</span></div>' + det(x) + '</div>').join('');
@@ -1118,7 +1185,10 @@ function secCode(d) {
   else if (S.lang === 'tailwind') { body = codeBlock(d.tailwind || '', 'tw'); copyAll = d.tailwind; }
   else {
     const c = S.code[S.lang];
-    if (!c) { body = '<div class="code"><pre class="faint" style="padding:10px 14px">Generating clean code for the whole layer tree…</pre></div>'; requestCode(S.lang); }
+    const failed = (S.codeError || {})[S.lang];
+    if (!c && failed) {
+      body = '<div class="warn" style="margin:0 0 8px">' + esc(failed) + '</div><div class="row"><button class="btn" data-act="code-retry">Try again</button></div>';
+    } else if (!c) { body = '<div class="code"><pre class="faint" style="padding:10px 14px">Generating clean code for the whole layer tree…</pre></div>'; requestCode(S.lang); }
     else {
       const files = c.files || [];
       if (!files.some(f => f.name === S.file)) S.file = files[0] ? files[0].name : '';
@@ -1252,6 +1322,11 @@ function secPreview(d) {
 }
 function mountPreview() {
   const f = $('pv-frame'); if (!f || !S.pvMount) return;
+  // Re-assigning srcdoc reloads the iframe: the preview would flicker and lose its
+  // scroll on every unrelated state update. Only reload when the document changed.
+  const doc = previewDoc(S.pvMount.html, S.pvMount.ov);
+  if (f.__doc === doc) return;
+  f.__doc = doc;
   f.onload = () => {
     // grow to the HTML's real height so overflow / extra height is visible, not clipped
     try {
@@ -1264,7 +1339,7 @@ function mountPreview() {
       }
     } catch (e) { /* not same-origin — keep design height */ }
   };
-  f.srcdoc = previewDoc(S.pvMount.html, S.pvMount.ov);
+  f.srcdoc = doc;
 }
 function updateOverlay() {
   const f = $('pv-frame'); let el = null;
@@ -1346,8 +1421,14 @@ function a11yRow(g) {
   if (i.kind === 'contrast' && i.status !== 'unknown') {
     lead = '<span class="a-sw" style="color:' + esc(i.fg) + ';background:' + esc(i.bg) + '">Aa</span>';
     sub = esc(i.fg) + ' on ' + esc(i.bg) + (i.assumed ? ' (assumed white)' : '') + (i.large ? ' \u00b7 large text' : '');
+    // Faded content passes at its own colour but fails in the rendered design.
+    if (i.opacity !== undefined && i.opacity < 0.995) sub += ' \u00b7 ' + Math.round(i.opacity * 100) + '% opacity from a parent';
+    if (i.rule && /^[\d.]+$/.test(i.rule)) sub += ' \u00b7 WCAG ' + i.rule;
     meta = '<span class="a-ratio ' + i.status + '">' + i.ratio + ':1<small>' + (i.status === 'fail' ? 'needs ' + i.need : i.aaa ? 'AAA' : 'AA') + '</small></span>';
-  } else sub = esc(i.detail || '');
+  } else {
+    sub = esc(i.detail || '');
+    if (i.rule && /^[\d.]+$/.test(i.rule) && i.status !== 'pass') sub += ' \u00b7 WCAG ' + i.rule;
+  }
   const many = g.count > 1 ? '<span class="a-count" title="' + g.count + ' layers have this exact problem">+' + (g.count - 1) + ' more</span>' : '';
   const name = esc(i.name);
   return '<div class="list-row a-row" data-select="' + esc(g.ids ? g.ids[0] : i.id) + '">' + lead + '<span class="ln"><span>' + name + '</span><small>' + sub + '</small></span>' + many + meta + '</div>';
@@ -1367,7 +1448,7 @@ function secA11y(d) {
   const more = shown.length > capped.length ? '<button class="mini" data-act="a11y-more" style="margin-top:4px">Show ' + (shown.length - capped.length) + ' more</button>' : '';
   const toggle = c.pass ? '<button class="mini" data-act="a11y-all" style="margin-top:4px">' + (S.a11yAll ? 'Show only issues' : 'Show ' + c.pass + ' passing') + '</button>' : '';
   const empty = !issues.length && !S.a11yAll ? '<div class="muted" style="padding:2px 0 4px">No contrast or touch-target problems found in this layer.</div>' : '';
-  return sec('Accessibility', '', pills + rows + more + empty + toggle + '<div class="faint" style="margin-top:6px">WCAG 2.2 AA: text 4.5:1 (3:1 for large text), targets 24\u00d724 (44\u00d744 recommended on touch). Checked ' + a.scanned + ' layers' + (a.limited ? ' (stopped at the limit)' : '') + '.</div>', c.fail + c.warn);
+  return sec('Accessibility', '', pills + rows + more + empty + toggle + '<div class="faint" style="margin-top:6px">WCAG 2.2 AA: text 4.5:1 (3:1 for large text), targets 24\u00d724 (44\u00d744 recommended on touch). Checked ' + a.scanned + ' layers' + (a.limited ? ' (stopped at the layer limit)' : '') + (a.depthLimited ? ' (deeper layers skipped)' : '') + '. Opacity from parent layers is included. Backgrounds that can\u2019t be measured are reported as unmeasured, never as a pass.</div>', c.fail + c.warn);
 }
 
 /* ---------- Design tokens export ---------- */
@@ -1383,7 +1464,7 @@ function secTokens(d, fileOnly) {
   if (T.busy) body += '<div class="faint">Reading variables\u2026</div>';
   else if (o && o.format === T.format && o.scope === T.scope) {
     if (o.empty) body += '<div class="muted">No variables' + (T.scope === 'selection' ? ' are bound to this layer.' : ' or styles in this file.') + '</div><button class="btn" data-act="tok-gen" style="margin-top:6px">Try again</button>';
-    else {body += codeBlock(o.text, o.lang || 'css') + '<div class="code-foot"><span class="stats">' + o.stats.variables + ' variables' + (o.stats.modes ? ' \u00b7 ' + o.stats.modes + ' modes' : '') + (o.stats.styles ? ' \u00b7 ' + o.stats.styles + ' styles' : '') + '</span>' +
+    else {body += diagNote(T.diag) + codeBlock(o.text, o.lang || 'css') + '<div class="code-foot"><span class="stats">' + o.stats.variables + ' variables' + (o.stats.modes ? ' \u00b7 ' + o.stats.modes + ' modes' : '') + (o.stats.styles ? ' \u00b7 ' + o.stats.styles + ' styles' : '') + (o.stats.library ? ' \u00b7 ' + o.stats.library + ' from libraries' : '') + (o.stats.aliases ? ' \u00b7 ' + o.stats.aliases + ' aliased' : '') + (o.stats.unresolved ? ' \u00b7 ' + o.stats.unresolved + ' unresolved' : '') + '</span>' +
       '<button class="btn" data-act="tok-copy">' + I.copy + 'Copy</button><button class="btn blue" data-act="tok-dl">' + I.dl + esc(o.file) + '</button></div>';}
   } else body += '<button class="btn blue" data-act="tok-gen">Generate ' + esc(TOK_FORMATS[T.format]) + '</button>';
   return sec('Design tokens', '', body);
@@ -1396,12 +1477,24 @@ const FMTS = [['SVG:1', 'SVG'], ['PNG:1', 'PNG 1x'], ['PNG:2', 'PNG 2x'], ['PNG:
 /* ---------- code requests ---------- */
 let pending = {};
 let codeRequestSeq = 0;
+/* A dropped response (layer deleted mid-request, plugin reload, Figma hiccup)
+   used to leave "Generating…" on screen forever. Every request now resolves:
+   either a matching code message clears it, or the timeout offers a retry. */
+const CODE_TIMEOUT_MS = 20000;
 function requestCode(lang) {
   if (pending[lang]) return;
   const requestId = ++codeRequestSeq;
   pending[lang] = requestId;
+  S.codeError = S.codeError || {};
+  delete S.codeError[lang];
   if (S.demo) { setTimeout(() => { S.code[lang] = DEMO_CODE[lang]; pending[lang] = false; render(); }, 200); return; }
   send({ type: 'gen-code', lang: lang, requestId: requestId, nodeId: S.data && S.data.spec ? S.data.spec.id : '' });
+  setTimeout(() => {
+    if (pending[lang] !== requestId) return;
+    pending[lang] = false;
+    S.codeError[lang] = 'Code generation timed out. The layer may be very large, or the plugin lost the request.';
+    if (S.data && S.data.spec) render();
+  }, CODE_TIMEOUT_MS);
 }
 
 /* ===================================================================
@@ -1411,17 +1504,27 @@ let menuHandlers = [];
 function openMenu(anchor, items) {
   const m = $('menu'); menuHandlers = [];
   m.innerHTML = items.map(it => {
-    if (it === '-') return '<div class="ms"></div>';
-    if (it.header) return '<div class="mh">' + esc(it.header) + '</div>';
+    if (it === '-') return '<div class="ms" role="separator"></div>';
+    if (it.header) return '<div class="mh" role="presentation">' + esc(it.header) + '</div>';
     menuHandlers.push(it.run);
-    return '<div class="mi' + (it.disabled ? ' dis' : '') + '" data-mi="' + (menuHandlers.length - 1) + '"><span class="ck">' + (it.checked ? I.check : '') + '</span>' + esc(it.label) + '</div>';
+    return '<div class="mi' + (it.disabled ? ' dis' : '') + '" role="menuitem" tabindex="-1" aria-disabled="' + (it.disabled ? 'true' : 'false') + '" data-mi="' + (menuHandlers.length - 1) + '"><span class="ck" aria-hidden="true">' + (it.checked ? I.check : '') + '</span>' + esc(it.label) + '</div>';
   }).join('');
+  if (S.menuAnchor && S.menuAnchor !== anchor) S.menuAnchor.setAttribute('aria-expanded', 'false');
+  S.menuAnchor = anchor;
+  try { anchor.setAttribute('aria-expanded', 'true'); anchor.setAttribute('aria-haspopup', 'menu'); } catch (e) { /* svg anchor */ }
   m.classList.add('on');
   const r = anchor.getBoundingClientRect(), mw = m.offsetWidth, mh = m.offsetHeight;
   m.style.left = Math.max(4, Math.min(innerWidth - mw - 4, r.right - mw)) + 'px';
   m.style.top = (r.bottom + mh + 4 > innerHeight ? Math.max(4, r.top - mh - 4) : r.bottom + 4) + 'px';
+  // Keyboard users land on the first item instead of staying behind the menu.
+  const first = m.querySelector('.mi:not(.dis)');
+  if (first) { try { first.focus({ preventScroll: true }); } catch (e) { first.focus(); } }
 }
-function closeMenu() { $('menu').classList.remove('on'); }
+function closeMenu() {
+  const m = $('menu');
+  if (m) m.classList.remove('on');
+  if (S.menuAnchor) { try { S.menuAnchor.setAttribute('aria-expanded', 'false'); } catch (e) { /* ignore */ } }
+}
 function setSetting(patch) {
   S.data.settings = Object.assign({}, S.data.settings, patch); S.code = {}; pending = {};
   send({ type: 'settings', settings: patch }); render();
@@ -1510,6 +1613,10 @@ document.addEventListener('click', e => {
   if (act === 'notes-clear') { send({ type: 'notes-clear' }); return; }
   if (act === 'view-code' || act === 'view-preview') { S.view = act.slice(5); render(); return; }
   if (/^cmp-/.test(act)) { S.cmp = act.slice(4); if (S.cmp === 'overlay' && S.demo) toast('Design overlay works inside Figma'); render(); return; }
+  if (act === 'code-retry') {
+    S.codeError = S.codeError || {}; delete S.codeError[S.lang];
+    pending[S.lang] = false; requestCode(S.lang); render(); return;
+  }
   if (act === 'copy-file') {
     const c = S.code[S.lang]; const cur = c && ((c.files || []).find(x => x.name === S.file) || c.files[0]);
     if (cur) copy(cur.code); return;
@@ -1555,12 +1662,37 @@ document.addEventListener('click', e => {
   }
 });
 window.addEventListener('blur', closeMenu);
+document.addEventListener('keydown', e => {
+  const menu = $('menu');
+  const open = !!(menu && menu.classList.contains('on'));
+  if (e.key === 'Escape') {
+    if (open) { const a = S.menuAnchor; closeMenu(); if (a && a.focus) a.focus(); e.preventDefault(); return; }
+    if (S.form) { S.form = null; render(); e.preventDefault(); }
+    return;
+  }
+  if (!open) return;
+  const items = Array.from(menu.querySelectorAll('.mi:not(.dis)'));
+  if (!items.length) return;
+  const cur = items.indexOf(document.activeElement);
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    const next = e.key === 'ArrowDown' ? (cur + 1) % items.length : (cur <= 0 ? items.length - 1 : cur - 1);
+    items[next].focus();
+  } else if (e.key === 'Home') { e.preventDefault(); items[0].focus(); }
+  else if (e.key === 'End') { e.preventDefault(); items[items.length - 1].focus(); }
+  else if (e.key === 'Enter' || e.key === ' ') {
+    if (cur > -1) { e.preventDefault(); items[cur].click(); }
+  }
+});
 document.addEventListener('input', e => {
   if (e.target.id === 'pv-op') { S.opacity = +e.target.value; const v = $('pv-opv'); if (v) v.textContent = S.opacity + '%'; updateOverlay(); }
   if (e.target.id === 'pv-diff') { S.diff = e.target.checked; if (S.diff && S.opacity < 100) { S.opacity = 100; const r = $('pv-op'); if (r) r.value = 100; const v = $('pv-opv'); if (v) v.textContent = '100%'; } updateOverlay(); }
 });
 
 window.onmessage = ev => {
+  // Figma delivers plugin messages from the parent frame. Direct calls without a
+  // source (the browser test harness) are still accepted.
+  if (ev.source && window.parent && ev.source !== window.parent) return;
   const m = ev.data && ev.data.pluginMessage; if (!m) return;
   if (['loading', 'state', 'code', 'download', 'error', 'thumb', 'project', 'design-shot', 'fonts-updated', 'ann-result', 'tokens'].indexOf(m.type) === -1) return;
   S.got = true; S.demo = false;
@@ -1568,7 +1700,7 @@ window.onmessage = ev => {
   else if (m.type === 'state') {
     $('bar').classList.remove('on');
     if (!S.data || !S.data.spec || !m.spec || S.data.spec.id !== m.spec.id) S.form = null;
-    S.data = m; S.code = {}; S.codeFor = ''; pending = {};
+    S.data = m; S.code = {}; S.codeFor = ''; pending = {}; S.codeError = {}; S.pvDoc = '';
     if (m.mode !== 'inspect') { Object.keys(S.thumbs).forEach(k => URL.revokeObjectURL(S.thumbs[k])); S.thumbs = {}; }
     closeMenu(); render();
   }
@@ -1584,7 +1716,7 @@ window.onmessage = ev => {
     S.code[m.lang] = m.out; pending[m.lang] = false; render();
     if (m.out.assetErrors && m.out.assetErrors.length) toast(m.out.assetErrors.length + ' asset export issue' + (m.out.assetErrors.length === 1 ? '' : 's') + ' — retry in Figma before downloading');
   }
-  else if (m.type === 'tokens') { S.tok = S.tok || { format: m.format, scope: m.scope }; S.tok.busy = false; S.tok.out = Object.assign({ format: m.format, scope: m.scope }, m.out); render(); }
+  else if (m.type === 'tokens') { S.tok = S.tok || { format: m.format, scope: m.scope }; S.tok.busy = false; S.tok.diag = m.diagnostics || []; S.tok.out = Object.assign({ format: m.format, scope: m.scope }, m.out); render(); }
   else if (m.type === 'fonts-updated') { S.code = {}; pending = {}; render(); }
   else if (m.type === 'ann-result') { if (!m.ok) { S.annHelp = true; render(); } }
   else if (m.type === 'download') {
@@ -1625,9 +1757,10 @@ const DEMO_TOKENS = {
 };
 const DEMO = {
   type: 'state', mode: 'inspect', editor: 'figma', isDev: false, count: 1,
-  settings: { gate: 'strict', unit: 'px', remBase: 16, colorFormat: 'hex', pluginFlag: true },
+  settings: { gate: 'strict', unit: 'px', remBase: 16, colorFormat: 'hex', pluginFlag: true, previewFonts: 'google' },
+  limits: { maxDepth: 120, snapLimit: 2500, a11yLimit: 400 },
   status: { type: 'READY_FOR_DEV', description: 'Updated CTA color and spacing after review.', nodeId: '1:1', nodeName: 'Checkout / Mobile', source: 'figma' },
-  target: { id: '1:1', name: 'Checkout / Mobile', type: 'FRAME' },
+  target: { id: '1:1', name: 'Checkout / Mobile', type: 'FRAME', native: true },
   spec: {
     id: '1:20', name: 'Pay button', type: 'INSTANCE', size: { w: 327, h: 48 }, pos: { x: 24, y: 712 },
     component: { kind: 'Instance', name: 'Button', variant: 'Variant=Primary, Size=Large', description: 'Keywords: button, cta, action, submit, pay', mainId: '9:1', mapKey: 'k1',
@@ -1649,18 +1782,18 @@ const DEMO = {
     layers: { ancestors: [{ id: '1:1', name: 'Checkout / Mobile', type: 'FRAME' }, { id: '1:15', name: 'Footer', type: 'FRAME' }],
       children: [{ id: '1:21', name: 'icon/lock', type: 'INSTANCE', visible: true, kids: 1 }, { id: '1:23', name: 'Pay ₹1,499', type: 'TEXT', visible: true, kids: 0 }, { id: '1:22', name: 'icon/arrow-right', type: 'INSTANCE', visible: true, kids: 1 }], more: 0 }
   },
-  changes: { at: '2026-10-18T10:42:00.000Z', values: true, count: 3, containerId: '1:1', containerName: 'Checkout / Mobile', changes: [
+  changes: { at: '2026-10-18T10:42:00.000Z', values: true, count: 3, partial: false, limit: 2500, containerId: '1:1', containerName: 'Checkout / Mobile', changes: [
     { id: '1:20', name: 'Pay button', kind: 'changed', parts: ['style'], detail: [{ prop: 'Fill', before: '#7B61FF', after: '#0D99FF' }, { prop: 'Radius', before: '8', after: '12' }] },
     { id: '1:23', name: 'Pay ₹1,499', kind: 'changed', parts: ['text'], detail: [{ prop: 'Text', before: 'Pay ₹1,299', after: 'Pay ₹1,499' }] },
     { id: null, name: 'Promo banner', kind: 'removed', parts: [] }] },
   css: '/* Auto layout */\ndisplay: flex;\npadding: 12px 24px;\njustify-content: center;\nalign-items: center;\ngap: var(--space-200, 8px);\n\n/* Layout */\nalign-self: stretch;\n\n/* Style */\nborder-radius: var(--radius-300, 12px);\nbackground: var(--brand-primary, #0D99FF);\nbox-shadow: 0 4px 12px 0 rgba(13, 153, 255, 0.25);',
   tailwind: 'flex px-6 py-3 justify-center items-center gap-[var(--space-200,8px)] self-stretch rounded-[var(--radius-300,12px)] bg-[var(--brand-primary,#0D99FF)] shadow-[0_4px_12px_0_rgba(13,153,255,0.25)]',
-  a11y: { scanned: 12, limited: false, counts: { fail: 2, warn: 2, pass: 3, unknown: 0 }, items: [
-    { id: '1:23', name: 'Pay \u20b91,499', kind: 'contrast', status: 'fail', ratio: 3.02, need: 4.5, aaa: false, large: false, fg: '#7BC4FF', bg: '#0D99FF', assumed: false, size: 14 },
-    { id: '1:30', name: 'Promo terms', kind: 'contrast', status: 'fail', ratio: 2.48, need: 4.5, aaa: false, large: false, fg: '#9CA3AF', bg: '#FFFFFF', assumed: true, size: 12 },
-    { id: '1:20', name: 'Pay button', kind: 'target', status: 'warn', detail: '327\u00d740 \u2014 aim for 44\u00d744 on touch screens' },
-    { id: '1:31', name: 'Close', kind: 'label', status: 'warn', detail: 'No visible text \u2014 give it an accessible name (aria-label / contentDescription)' },
-    { id: '1:25', name: 'Subtotal', kind: 'contrast', status: 'pass', ratio: 12.63, need: 4.5, aaa: true, large: false, fg: '#111827', bg: '#FFFFFF', assumed: false, size: 14 }] },
+  a11y: { scanned: 12, limited: false, depthLimited: false, counts: { fail: 2, warn: 2, pass: 3, unknown: 0 }, byRule: { '1.4.3': 2, '2.5.8': 0, '4.1.2': 0 }, items: [
+    { rule: '1.4.3', id: '1:23', name: 'Pay \u20b91,499', kind: 'contrast', status: 'fail', ratio: 3.02, need: 4.5, aaa: false, large: false, fg: '#7BC4FF', bg: '#0D99FF', assumed: false, confidence: 'measured', opacity: 1, size: 14 },
+    { rule: '1.4.3', id: '1:30', name: 'Promo terms', kind: 'contrast', status: 'fail', ratio: 2.48, need: 4.5, aaa: false, large: false, fg: '#9CA3AF', bg: '#FFFFFF', assumed: true, confidence: 'assumed', opacity: 0.6, size: 12 },
+    { rule: '2.5.8', id: '1:20', name: 'Pay button', kind: 'target', status: 'warn', detail: '327\u00d740 \u2014 aim for 44\u00d744 on touch screens' },
+    { rule: '4.1.2', id: '1:31', name: 'Close', kind: 'label', status: 'warn', detail: 'No visible text \u2014 give it an accessible name (aria-label / contentDescription)' },
+    { rule: '1.4.3', id: '1:25', name: 'Subtotal', kind: 'contrast', status: 'pass', ratio: 12.63, need: 4.5, aaa: true, large: false, fg: '#111827', bg: '#FFFFFF', assumed: false, confidence: 'measured', opacity: 1, size: 14 }] },
   measure: { mode: 'inset', outer: 'Checkout / Mobile', inner: 'Button', top: 712, right: 24, bottom: 52, left: 24, segments: [] },
   assets: [{ id: '1:20', name: 'Pay button', type: 'INSTANCE', kind: 'selection', w: 327, h: 48 }, { id: '1:21', name: 'icon/lock', type: 'INSTANCE', kind: 'icon', w: 20, h: 20 }, { id: '1:22', name: 'icon/arrow-right', type: 'INSTANCE', kind: 'icon', w: 20, h: 20 }]
 };

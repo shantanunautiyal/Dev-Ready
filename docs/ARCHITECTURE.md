@@ -1,7 +1,7 @@
 # Architecture
 
 A map of the repository for someone who has to change the code, written to be read
-in ten minutes. It describes v1.2.0.
+in ten minutes. It describes v1.5.1.
 
 There is **no build step**. `code.js` and `ui.html` are loaded by Figma exactly as
 they are committed, so both are one file each, dependency-free, and ES2020-era

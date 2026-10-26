@@ -12,6 +12,29 @@
 
 const NS = 'devready'; // shared plugin data namespace
 const IS_DEV = figma.editorType === 'dev';
+/* Figma APIs come and go with plan, editor mode and file age: a call that fails
+   used to be swallowed by an empty catch, so the panel quietly showed fewer
+   tokens / fonts / mappings with no explanation. Every degraded call now leaves
+   a short note behind, which the panel lists as "limited data". Bounded and
+   de-duplicated so a hot loop cannot flood it. */
+const DIAGS = [];
+const DIAG_LIMIT = 12;
+function diag(where, err) {
+  if (DIAGS.length >= DIAG_LIMIT) return;
+  const msg = String(where || 'unknown step');
+  if (DIAGS.some(d => d.where === msg)) return;
+  const detail = err && err.message ? String(err.message) : err ? String(err) : '';
+  DIAGS.push({ where: msg, detail: detail.slice(0, 160) });
+}
+function clearDiagnostics() { DIAGS.length = 0; }
+function takeDiagnostics() { return DIAGS.slice(0); }
+/* Hidden instance children can't be selected or inspected, so skipping them saves
+   API calls on instance-heavy files. Guarded for Figma versions without the flag. */
+try { figma.skipInvisibleInstanceChildren = true; } catch (e) { /* older Figma */ }
+/* A deeply nested layer tree (Sketch/Illustrator/AI-generated layer soup) can be
+   thousands of levels deep. Every traversal in this file is recursive, so the
+   limit is enforced once and reported to the user instead of overflowing the stack. */
+const MAX_DEPTH = 120;
 const DEFAULT_SETTINGS = {
   gate: 'strict',        // 'strict' = only dev-ready designs, 'off' = always inspect
   unit: 'px',            // 'px' | 'rem'
@@ -29,6 +52,9 @@ let settings = Object.assign({}, DEFAULT_SETTINGS);
 /* range-checked. The UI is bundled, but this keeps the boundary narrow. */
 /* ------------------------------------------------------------------ */
 const LANG_IDS = ['react-tailwind', 'react-css', 'react-ts', 'react-tailwind-ts', 'html-css', 'html-single', 'vue', 'svelte', 'react-native', 'swiftui', 'compose', 'flutter'];
+/* One table for "file extension → Dev Mode code language". It used to live inline in
+   the codegen handler, where a new target could be added and forgotten. */
+const CODEGEN_LANG = { html: 'HTML', vue: 'HTML', svelte: 'HTML', css: 'CSS', jsx: 'JAVASCRIPT', tsx: 'TYPESCRIPT', ts: 'TYPESCRIPT', swift: 'SWIFT', kotlin: 'KOTLIN', dart: 'PLAINTEXT', text: 'PLAINTEXT' };
 const MAP_NAME_RE = /^[A-Za-z_$][\w$.]{0,79}$/;
 const MAP_PATH_RE = /^[\w@~.\-][\w@~.\/\-]{0,199}$/;
 const V = {
@@ -170,53 +196,100 @@ function markTarget(node) {
   }
   return null;
 }
+/**
+ * Where the DevReady flag goes when Figma's own status isn't available.
+ * Shared plugin data works on every node type and every plan, so the same
+ * container rule applies — but without the MARKABLE restriction. Without this,
+ * a design built from top-level groups could never be marked, and the gate
+ * would stay locked for the whole file.
+ */
+function flagTarget(node) {
+  let n = node;
+  while (n && n.parent) {
+    const pt = n.parent.type;
+    if (pt === 'PAGE' || pt === 'SECTION') return n.type === 'PAGE' || n.type === 'DOCUMENT' ? null : n;
+    n = n.parent;
+  }
+  return n && n.type !== 'PAGE' && n.type !== 'DOCUMENT' ? n : null;
+}
+
+/** The layer that a status would be written to, and whether Figma can hold it natively. */
+function statusTargets(node) {
+  const native = markTarget(node);
+  const flag = native || flagTarget(node);
+  return { native: native, flag: flag };
+}
 
 async function setReady(nodeId, type, note) {
   const node = await figma.getNodeByIdAsync(nodeId);
   if (!node) return { ok: false, error: 'Layer not found' };
-  const target = markTarget(node);
-  if (!target) return { ok: false, error: 'Select a frame, component or section that sits directly on the page or inside a section.' };
+  const t = statusTargets(node);
+  const target = t.flag;
+  if (!target) return { ok: false, error: 'Select a layer that sits on a page or inside a section.' };
+
+  // Keep the handoff note across routine status changes: clearing a status is
+  // explicit, and re-marking with an empty note must not erase the context.
+  let kept = '';
+  if (type) {
+    const own = ownStatus(target);
+    kept = (note && String(note).trim()) ? String(note) : (own ? own.description || '' : '');
+  }
 
   let native = false;
-  if (!IS_DEV) {
+  if (!IS_DEV && t.native) {
     try {
       if (type) {
         const ds = { type: type };
-        if (note) ds.description = note;
-        target.devStatus = ds;
+        if (kept) ds.description = kept;
+        t.native.devStatus = ds;
       } else {
-        target.devStatus = null;
+        t.native.devStatus = null;
       }
       native = true;
     } catch (e) {
       native = false; // e.g. free plan, nested status, or restricted
     }
   }
-  // Plugin flag (works on any plan and in Dev Mode, since pluginData is writable there)
-  target.setSharedPluginData(NS, 'status', native ? '' : (type || ''));
-  target.setSharedPluginData(NS, 'note', native ? '' : (note || ''));
-  target.setSharedPluginData(NS, 'at', type && !native ? new Date().toISOString() : '');
+  // The flag is always mirrored, not only when the native write fails. Teams mix
+  // paid and free seats: a free-plan collaborator, a viewer or another plugin can
+  // only read shared plugin data, and would otherwise see a ready design as locked.
+  target.setSharedPluginData(NS, 'status', type || '');
+  target.setSharedPluginData(NS, 'note', type ? kept : '');
+  target.setSharedPluginData(NS, 'at', type ? new Date().toISOString() : '');
   try { target.setRelaunchData(type ? { open: 'Dev ready — inspect specs & code' } : {}); } catch (e) { /* ignore */ }
   // Change tracking: snapshot the design when it's handed off
   try {
     if (type === 'READY_FOR_DEV') saveBaseline(target);
     else if (!type) clearBaseline(target);
   } catch (e) { /* ignore */ }
-  return { ok: true, native: native, name: target.name };
+  return { ok: true, native: native, name: target.name, note: kept, source: native ? 'figma' : 'plugin' };
 }
 
-/** All designs with a status on the current page (top level + inside sections). */
-function listReady() {
+/**
+ * All designs with a status (top level + nested sections).
+ * scope: 'page' (default, fast) | 'file' (every page, for the handoff inbox).
+ */
+function listReady(scope) {
   const out = [];
-  function visit(parent, depth) {
-    if (!('children' in parent) || depth > 4) return;
+  let pages = [figma.currentPage];
+  if (scope === 'file') {
+    try { if (figma.root && figma.root.children && figma.root.children.length) pages = figma.root.children; } catch (e) { /* page-scoped only */ }
+  }
+  const seen = {};
+  const MAX_SECTION_DEPTH = 8;
+  function visit(parent, depth, pageName) {
+    if (!('children' in parent) || depth > MAX_SECTION_DEPTH) return;
     for (const n of parent.children) {
       const s = ownStatus(n);
-      if (s) out.push({ id: n.id, name: n.name, type: n.type, status: s.type, note: s.description, source: s.source });
-      if (n.type === 'SECTION') visit(n, depth + 1);
+      if (s) out.push({ id: n.id, name: n.name, type: n.type, status: s.type, note: s.description, source: s.source, page: pageName });
+      if (n.type === 'SECTION') visit(n, depth + 1, pageName);
     }
   }
-  visit(figma.currentPage, 0);
+  pages.forEach(p => {
+    if (!p || p.type !== 'PAGE' || seen[p.id]) return;
+    seen[p.id] = 1;
+    visit(p, 0, p.name);
+  });
   return out;
 }
 
@@ -258,6 +331,16 @@ async function styleName(id) {
   } catch (e) { /* ignore */ }
   styleCache[id] = name;
   return name;
+}
+/**
+ * Variables, styles and collections can be renamed or edited while the plugin is
+ * open. Without dropping these caches the panel keeps showing the old name (or a
+ * stale "not found") for the rest of the session. Called on every document change;
+ * diffCache is part of the same invalidation.
+ */
+function clearLookupCaches() {
+  [varCache, styleCache, collCache].forEach(cache => { Object.keys(cache).forEach(k => { delete cache[k]; }); });
+  Object.keys(diffCache).forEach(k => { diffCache[k] = null; });
 }
 
 /* ------------------------------------------------------------------ */
@@ -742,24 +825,29 @@ function cssToTailwind(css, unit, base) {
 /* Asset detection                                                     */
 /* ------------------------------------------------------------------ */
 const VECTORISH = { VECTOR: 1, BOOLEAN_OPERATION: 1, STAR: 1, LINE: 1, ELLIPSE: 1, POLYGON: 1, RECTANGLE: 1 };
-function allVector(n) {
+const ASSET_WALK_LIMIT = 2000;
+function allVector(n, depth, seen) {
   // Image-filled rectangles/ellipses are raster content, even though their node
   // type is vector-ish. Check every descendant so avatar stacks are not exported
-  // as one opaque SVG icon.
+  // as one opaque SVG icon. Bounded: a pathological tree must not overflow.
+  depth = depth || 0; seen = seen || { n: 0 };
+  if (depth > MAX_DEPTH || seen.n++ > ASSET_WALK_LIMIT) return false;
   if (n.visible === false || hasImageFill(n)) return false;
   if (!('children' in n)) return !!VECTORISH[n.type];
   if (n.type === 'BOOLEAN_OPERATION') return true;
   const kids = n.children.filter(c => c.visible !== false);
   if (!kids.length) return false;
-  for (const c of kids) { if (!allVector(c)) return false; }
+  for (const c of kids) { if (!allVector(c, depth + 1, seen)) return false; }
   return true;
 }
 function hasImageFill(n) {
   return 'fills' in n && !isMixed(n.fills) && n.fills.some(f => f.type === 'IMAGE' && f.visible !== false);
 }
-function hasNestedImageFill(n) {
+function hasNestedImageFill(n, depth, seen) {
+  depth = depth || 0; seen = seen || { n: 0 };
+  if (depth > MAX_DEPTH || seen.n++ > ASSET_WALK_LIMIT) return false;
   if (hasImageFill(n)) return true;
-  return 'children' in n && n.children.some(c => c.visible !== false && hasNestedImageFill(c));
+  return 'children' in n && n.children.some(c => c.visible !== false && hasNestedImageFill(c, depth + 1, seen));
 }
 function isIconLike(n) {
   // A vector-shaped container is still raster artwork when any visible paint or
@@ -775,8 +863,9 @@ function isIconLike(n) {
 function collectAssets(root, limit) {
   const out = [];
   let visited = 0;
-  (function walk(n) {
+  (function walk(n, depth) {
     if (out.length >= limit || visited++ > 4000) return;
+    if (depth > MAX_DEPTH) return;
     if (n.visible === false) return;
     const hasExport = 'exportSettings' in n && n.exportSettings.length > 0;
     if (hasExport) {
@@ -785,8 +874,8 @@ function collectAssets(root, limit) {
     }
     if (n !== root && isIconLike(n)) { out.push({ id: n.id, name: n.name, type: n.type, kind: 'icon', w: round(n.width), h: round(n.height) }); return; }
     if (hasImageFill(n)) out.push({ id: n.id, name: n.name, type: n.type, kind: 'image', w: round(n.width), h: round(n.height) });
-    if ('children' in n) for (const c of n.children) walk(c);
-  })(root);
+    if ('children' in n) for (const c of n.children) walk(c, depth + 1);
+  })(root, 0);
   return out;
 }
 
@@ -934,12 +1023,13 @@ function applyGeometry(node, el, isRoot) {
   if (container && node.clipsContent && !c.overflow) c.overflow = 'hidden';
   return el;
 }
-async function buildRaw(node, ctx, isRoot, inInst) {
-  return applyGeometry(node, await buildRawNode(node, ctx, isRoot, inInst), isRoot);
+async function buildRaw(node, ctx, isRoot, inInst, depth) {
+  return applyGeometry(node, await buildRawNode(node, ctx, isRoot, inInst, depth || 0), isRoot);
 }
-async function buildRawNode(node, ctx, isRoot, inInst) {
+async function buildRawNode(node, ctx, isRoot, inInst, depth) {
   if (node.visible === false || node.opacity === 0) return null;
   if (ctx.count >= ctx.max) { ctx.truncated = true; return null; }
+  if (depth > MAX_DEPTH) { ctx.truncated = true; ctx.depthLimited = true; return null; }
   ctx.count++;
   const el = { id: node.id, type: node.type, name: node.name, generic: nodeIsGeneric(node), kind: 'box', tag: 'div', css: {}, children: [], attrs: {}, inInst: !!inInst, w: node.width, h: node.height };
   const rawCss = await safeCSS(node);
@@ -1035,7 +1125,7 @@ async function buildRawNode(node, ctx, isRoot, inInst) {
   }
 
   if ('children' in node) {
-    const kids = await Promise.all(node.children.map(c => buildRaw(c, ctx, false, inInst || node.type === 'INSTANCE')));
+    const kids = await Promise.all(node.children.map(c => buildRaw(c, ctx, false, inInst || node.type === 'INSTANCE', depth + 1)));
     el.children = kids.filter(Boolean);
   }
   el.isBlock = !isRoot && (node.type === 'INSTANCE' || node.type === 'COMPONENT') && !!(el.comp || !el.generic);
@@ -1684,10 +1774,68 @@ function utf8(bytes) {
   for (let i = 0; i < bytes.length; i += 8192) b += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
   try { return decodeURIComponent(escape(b)); } catch (e) { return b; }
 }
-/** Exported SVG to inline-able markup: no XML header/comments, size comes from CSS. */
+/**
+ * Exported SVG to inline-able markup: no XML header/comments, size comes from CSS.
+ * Exported artwork is design content, but an SVG is also an executable document
+ * when it is ever loaded directly, so anything scriptable, remote or style-bearing
+ * is rejected rather than sanitised. Returns null → the caller embeds the raw
+ * bytes as a data URI in an <img>, where nothing inside can run.
+ */
+/* Elements that can execute, fetch or replace the document when an exported SVG is
+   inlined into generated HTML. `image`, `use` and `animate` are here because they
+   can pull a remote resource or rewrite an href to a script URL. */
+const SVG_BAD = /<\s*(script|foreignObject|iframe|object|embed|style|link|meta|base|audio|video|canvas|image|feImage|animate|animateMotion|animateTransform|set|handler|discard|listen)\b/i;
+/* Named/numeric entities are decoded before values are checked: `javascript&#58;`
+   is the same string to a browser but not to a naive regex. */
+const SVG_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", colon: ':', tab: '\t', newline: '\n', sol: '/' };
+function svgDecode(v) {
+  return String(v).replace(/&(#x?[0-9a-f]+|[a-z]+);?/gi, (m, body) => {
+    if (body[0] === '#') {
+      const code = body[1] === 'x' || body[1] === 'X' ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
+      return isFinite(code) && code > 0 && code < 0x110000 ? String.fromCharCode(code) : '';
+    }
+    const k = body.toLowerCase();
+    return Object.prototype.hasOwnProperty.call(SVG_ENTITIES, k) ? SVG_ENTITIES[k] : m;
+  });
+}
+/** Attributes of a raw `<tag …>` body, tokenised the way a parser reads them. */
+function svgAttrs(raw) {
+  const out = [];
+  const re = /([A-Za-z_:][-\w:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g;
+  let m;
+  while ((m = re.exec(raw))) {
+    out.push({ name: m[1].toLowerCase(), value: m[2] !== undefined ? m[2] : m[3] !== undefined ? m[3] : m[4] });
+  }
+  return out;
+}
+/** Anything that would execute or reach the network if this markup is inlined. */
+function svgUnsafe(t) {
+  if (/@import|expression\s*\(/i.test(t)) return true;
+  if (/url\(\s*['"]?\s*(?:https?:|\/\/|javascript:|vbscript:|data:text\/html)/i.test(svgDecode(t))) return true;
+  const re = /<\s*([A-Za-z][\w:.-]*)([^>]*)>/g;
+  let m;
+  while ((m = re.exec(t))) {
+    const tag = m[1].toLowerCase();
+    // `<use href="#id">` is safe (same document); an external one is caught by the href rule.
+    if (/^(script|foreignobject|iframe|object|embed|style|link|meta|base|audio|video|canvas|image|feimage|animate|animatemotion|animatetransform|set|handler|discard|listen)$/.test(tag)) return true;
+    const attrs = svgAttrs(svgDecode(m[2]));
+    for (const a of attrs) {
+      const name = a.name;
+      if (/^on/.test(name)) return true;
+      const value = svgDecode(a.value).replace(/[\u0000-\u001f\u007f\s]/g, '');
+      if (/(?:javascript|vbscript|data:text\/html|data:image\/svg\+xml):?/i.test(value) && /javascript|vbscript|text\/html|svg\+xml/i.test(value)) return true;
+      // href/src and friends may not leave the document (or the plugin's CSP)
+      if (/^(href|xlink:href|src|action|formaction|poster|data)$/.test(name) && /^(?:https?:|\/\/)/i.test(value)) return true;
+    }
+  }
+  return false;
+}
 function cleanSvg(text) {
-  let t = String(text).replace(/<\?xml[^>]*\?>/g, '').replace(/<[!]--[\s\S]*?--[>]/g, '').trim();
-  if (!/^<svg\b/.test(t) || t.length > 200000 || /<script\b|\son[a-z]+\s*=/i.test(t)) return null;
+  let t = String(text).replace(/<\?xml[^>]*\?>/g, '').replace(/<[!]--[\s\S]*?--[>]/g, '').replace(/<!DOCTYPE[^>]*>/gi, '').trim();
+  if (!/^<svg\b/.test(t) || t.length > 200000) return null;
+  if (SVG_BAD.test(t)) return null;
+  if (/javascript:/i.test(t)) return null;
+  if (svgUnsafe(t)) return null;
   t = t.replace(/^<svg\b([^>]*)>/, (m, attrs) => '<svg' + attrs.replace(/\s(width|height)="[^"]*"/g, '') + '>');
   return t;
 }
@@ -1701,8 +1849,37 @@ function embedImage(ctx, name, value) {
   ctx.embed.names[n] = 1; ctx.embed.byValue[value] = n; ctx.embed.list.push({ name: n, value: value });
   return n;
 }
+/* Text scripts decide the document language and direction, so a screen reader
+   announces an Arabic or Japanese design correctly. Latin-only designs keep
+   lang="en" and no dir attribute, as before. */
+const DOC_SCRIPTS = [
+  { re: /[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]/g, lang: 'ar', rtl: true },
+  { re: /[\u0590-\u05FF]/g, lang: 'he', rtl: true },
+  { re: /[\u0900-\u097F]/g, lang: 'hi' },
+  { re: /[\u0E00-\u0E7F]/g, lang: 'th' },
+  { re: /[\u3040-\u30FF]/g, lang: 'ja' },
+  { re: /[\uAC00-\uD7AF]/g, lang: 'ko' },
+  { re: /[\u4E00-\u9FFF]/g, lang: 'zh' },
+  { re: /[\u0400-\u04FF]/g, lang: 'ru' }
+];
+function docLang(root) {
+  let text = '';
+  walk(root, e => {
+    if (e.kind === 'text' && e.text && text.length < 4000) text += ' ' + String(e.text).slice(0, 4000);
+  });
+  let best = null;
+  DOC_SCRIPTS.forEach(sc => {
+    const hits = (text.match(sc.re) || []).length;
+    if (hits && (!best || hits > best.hits)) best = { lang: sc.lang, rtl: !!sc.rtl, hits: hits };
+  });
+  return best || { lang: 'en', rtl: false, hits: 0 };
+}
+function htmlOpenTag(root) {
+  const l = docLang(root);
+  return '<html lang="' + l.lang + '"' + (l.rtl ? ' dir="rtl"' : '') + '>';
+}
 function singleHtml(node, root, ctx, unit, base, note) {
-  return '<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8" />\n  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n  <title>' + escHtml(node.name) + '</title>\n' +
+  return '<!DOCTYPE html>\n' + htmlOpenTag(root) + '\n<head>\n  <meta charset="UTF-8" />\n  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n  <title>' + escHtml(node.name) + '</title>\n' +
     fontHead(ctx.fontPlan) +
     '  <!' + '-- Single-file build from Figma (DevReady) · open it directly in any browser. CSS and assets are embedded. --' + '>\n' +
     '  <style>\n/* Page preview canvas */\nbody { margin: 0; min-height: 100vh; display: flex; justify-content: center; align-items: flex-start; padding: 40px 16px; box-sizing: border-box; background: #F5F5F5; }\n\n' +
@@ -1715,20 +1892,21 @@ function singleHtml(node, root, ctx, unit, base, note) {
  * lang: 'html-css' | 'react-tailwind' | 'react-css'
  * returns { files: [{name, lang, code}], assets: [{id,file,format,scale}], truncated, stats }
  */
-async function generateCode(node, lang, unit, base, maxNodes, opts) {
+async function generateCodeInner(node, lang, unit, base, maxNodes, opts) {
   opts = opts || {};
+  const isReact = /^react-/.test(lang);
   const ctx = { lang: lang, count: 0, max: maxNodes || 600, truncated: false, maxFont: 0, assets: [], assetByKey: {}, assetNames: {}, vars: {}, classes: {}, order: [], weights: {}, usedTitle: false, rootWidth: node.width,
-    varIds: {}, themes: {}, tokenInfo: {}, imports: {}, fonts: {}, react: /^react-(tailwind|css)$/.test(lang), mappings: /^react-(tailwind|css)$/.test(lang) ? loadMappings() : {} };
-  const root = await buildRaw(node, ctx, true);
+    varIds: {}, themes: {}, tokenInfo: {}, imports: {}, fonts: {}, react: isReact, mappings: isReact ? loadMappings() : {} };
+  const root = await buildRaw(node, ctx, true, false, 0);
   if (!root) return { files: [{ name: 'empty.txt', lang: 'text', code: 'Nothing visible to generate.' }], assets: [] };
   await resolveAutoLineHeights(root, ctx, lang);
   structurePass(root, null, ctx, null);
   walk(root, e => { if (e.css['font-weight']) ctx.weights[e.css['font-weight']] = 1; (e.runs || []).forEach(r => { if (r.css && r.css['font-weight']) ctx.weights[r.css['font-weight']] = 1; }); });
   hoistFont(root);
   collectVars(root, ctx);
-  try { await resolveThemes(ctx); } catch (e) { /* variables API unavailable */ }
+  try { await resolveThemes(ctx); } catch (e) { diag('variable modes', e); }
   let fontPlan = { google: [], faces: [], files: [], families: [] };
-  try { fontPlan = await planFonts(ctx, lang, !!opts.withFonts, !!opts.fastFonts); } catch (e) { /* ignore */ }
+  try { fontPlan = await planFonts(ctx, lang, !!opts.withFonts, !!opts.fastFonts); } catch (e) { diag('font availability', e); }
   applyFontStacks(root, ctx, fontPlan);
   ctx.fontPlan = fontPlan;
   ctx.rootFont = root.css['font-family'] || '';
@@ -1749,7 +1927,8 @@ async function generateCode(node, lang, unit, base, maxNodes, opts) {
   const Comp = pascal(rootName);
   ctx.rootName = Comp;
   const notes = [];
-  if (ctx.truncated) notes.push('Output truncated after ' + ctx.max + ' layers — select a smaller frame for full code.');
+  if (ctx.depthLimited) notes.push('Layer tree deeper than ' + MAX_DEPTH + ' levels — nested layers beyond that are omitted. Select a child frame for the rest.');
+  if (ctx.truncated && !ctx.depthLimited) notes.push('Output truncated after ' + ctx.max + ' layers — select a smaller frame for full code.');
   if (ctx.autoLineHeight) notes.push(ctx.autoLineHeight + ' text layer' + (ctx.autoLineHeight === 1 ? '' : 's') + ' could not be measured; browser font metrics can differ. Set an explicit line-height for pixel-exact output.');
   if (ctx.assetErrors && ctx.assetErrors.length) notes.push(ctx.assetErrors.length + ' asset export issue' + (ctx.assetErrors.length === 1 ? '' : 's') + ' — download the project for details or retry in Figma.');
   const note = notes.join(' ');
@@ -1774,7 +1953,7 @@ async function generateCode(node, lang, unit, base, maxNodes, opts) {
   } else if (lang === 'html-single') {
     files.push({ name: rootName + '.html', lang: 'html', code: singleHtml(node, root, ctx, unit, base, note) });
   } else if (lang === 'html-css') {
-    const html = '<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8" />\n  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n  <title>' + escHtml(node.name) + '</title>\n' +
+    const html = '<!DOCTYPE html>\n' + htmlOpenTag(root) + '\n<head>\n  <meta charset="UTF-8" />\n  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n  <title>' + escHtml(node.name) + '</title>\n' +
       fontHead(ctx.fontPlan) + '  <link rel="stylesheet" href="styles.css" />\n</head>\n<body>\n' +
       (note ? '  <!' + '-- ' + note + ' --' + '>\n' : '') + renderHTML(root, 1) + '\n</body>\n</html>\n';
     files.push({ name: 'index.html', lang: 'html', code: html });
@@ -1818,9 +1997,30 @@ async function generateCode(node, lang, unit, base, maxNodes, opts) {
     fontFiles: opts.withFonts ? fontPlan.files : undefined,
     preview: { w: round(node.width), h: round(node.height), inlinedKB: Math.round(inlined / 1024) },
     truncated: ctx.truncated,
+    depthLimited: !!ctx.depthLimited,
     assetErrors: ctx.assetErrors || [],
     stats: { layers: ctx.count, classes: ctx.order.length, assets: ctx.assets.length, tokens: Object.keys(ctx.vars).length, modes: Object.keys(ctx.themes).length, mapped: Object.keys(ctx.imports).reduce((n, p) => n + Object.keys(ctx.imports[p]).length, 0) }
   };
+}
+/**
+ * Last-resort guard. Codegen must never throw into Figma's UI: a pathological
+ * tree, a remote library outage or an unexpected API shape should produce a
+ * readable explanation the user can act on, not a dead panel.
+ */
+async function generateCode(node, lang, unit, base, maxNodes, opts) {
+  try {
+    return await generateCodeInner(node, lang, unit, base, maxNodes, opts);
+  } catch (e) {
+    const msg = String((e && e.message) || e).slice(0, 300);
+    return {
+      files: [{ name: 'error.txt', lang: 'text', code: 'DevReady could not generate code for this layer.\n\n' + msg + '\n\nTry selecting a smaller frame, or a child frame of the design.' }],
+      assets: [], fonts: [], fontFiles: undefined,
+      preview: { w: round(node && node.width) || 0, h: round(node && node.height) || 0, inlinedKB: 0 },
+      truncated: false, depthLimited: false, assetErrors: [msg],
+      error: msg,
+      stats: { layers: 0, classes: 0, assets: 0, tokens: 0, modes: 0, mapped: 0 }
+    };
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1829,23 +2029,36 @@ async function generateCode(node, lang, unit, base, maxNodes, opts) {
 
 /* ---------- variable modes ---------- */
 const collCache = {};
+/**
+ * Collection lookup. Variables that come from a library live in a collection the
+ * file does not own: `getVariableCollectionByIdAsync` resolves them in current
+ * Figma builds but has returned null in older ones, which used to drop those
+ * variables from the token export entirely. Fall back to the published list.
+ */
 async function getColl(id) {
   if (collCache[id] !== undefined) return collCache[id];
   let c = null;
-  try { c = await figma.variables.getVariableCollectionByIdAsync(id); } catch (e) { /* remote */ }
+  try { c = await figma.variables.getVariableCollectionByIdAsync(id); } catch (e) { /* not this build */ }
+  if (!c) {
+    try {
+      const libs = await figma.variables.getAvailableLibraryVariableCollectionsAsync();
+      const hit = (libs || []).filter(x => x && x.id === id)[0];
+      if (hit) c = { id: hit.id, key: hit.key, name: hit.name, modes: hit.modes, defaultModeId: hit.defaultModeId, remote: true };
+    } catch (e) { /* no libraries / older Figma */ }
+  }
   collCache[id] = c;
   return c;
 }
 async function resolveVarValue(val, modeId, depth) {
   if (val && typeof val === 'object' && val.type === 'VARIABLE_ALIAS') {
-    if (depth > 6) return { value: null };
+    if (depth > 6) return { value: null, cycle: true };
     let v = null;
     try { v = await figma.variables.getVariableByIdAsync(val.id); } catch (e) { /* ignore */ }
-    if (!v) return { value: null };
+    if (!v) return { value: null, remote: true };
     let mv = v.valuesByMode[modeId];
     if (mv === undefined) { const c = await getColl(v.variableCollectionId); mv = c ? v.valuesByMode[c.defaultModeId] : v.valuesByMode[Object.keys(v.valuesByMode)[0]]; }
     const inner = await resolveVarValue(mv, modeId, depth + 1);
-    return { value: inner.value, alias: inner.alias || v.name };
+    return { value: inner.value, alias: inner.alias || v.name, cycle: inner.cycle, remote: inner.remote };
   }
   return { value: val };
 }
@@ -1871,9 +2084,12 @@ async function varModes(id) {
     const c = await getColl(v.variableCollectionId);
     base.cssName = base.web && /var\((--[^),\s]+)/.test(base.web) ? /var\((--[^),\s]+)/.exec(base.web)[1] : '--' + v.name.replace(/\//g, '-').replace(/\s+/g, '-');
     base.modes = [];
+    base.remote = !!(c && c.remote);
     if (c) {
       base.defaultModeId = c.defaultModeId;
-      for (const m of c.modes) {
+      const modes = c.modes && c.modes.length ? c.modes : Object.keys(v.valuesByMode || {}).map((mid, i) => ({ modeId: mid, name: i ? 'Mode ' + (i + 1) : 'Default' }));
+      base.defaultModeId = base.defaultModeId || (modes[0] && modes[0].modeId);
+      for (const m of modes) {
         const r = await resolveVarValue(v.valuesByMode[m.modeId], m.modeId, 0);
         base.modes.push({
           id: m.modeId, name: m.name, isDefault: m.modeId === c.defaultModeId,
@@ -1883,7 +2099,7 @@ async function varModes(id) {
         });
       }
     }
-  } catch (e) { base.modes = []; }
+  } catch (e) { base.modes = []; diag('variable modes', e); }
   return base;
 }
 function collectVarIds(node, ctx) {
@@ -1932,21 +2148,82 @@ async function resolveThemes(ctx) {
 /* ---------- change tracking ("changed since ready") ---------- */
 function hashStr(s) { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); }
 function safeVal(v) { return isMixed(v) ? 'mixed' : v; }
+/**
+ * Values that Figma reports as `figma.mixed` used to collapse to the string
+ * "mixed", so editing one corner radius, one stroke side or one text run was
+ * invisible to change tracking. Each item is now hashed individually.
+ */
+function radiusSig(n) {
+  if (!('cornerRadius' in n)) return 0;
+  if (isMixed(n.cornerRadius)) {
+    try { return [n.topLeftRadius, n.topRightRadius, n.bottomRightRadius, n.bottomLeftRadius].map(v => safeVal(v)).join('/'); } catch (e) { return 'mixed'; }
+  }
+  return safeVal(n.cornerRadius);
+}
+function strokeSig(n) {
+  if (!('strokes' in n)) return 0;
+  let weight;
+  try {
+    weight = isMixed(n.strokeWeight)
+      ? [n.strokeTopWeight, n.strokeRightWeight, n.strokeBottomWeight, n.strokeLeftWeight].map(v => safeVal(v)).join('/')
+      : safeVal(n.strokeWeight);
+  } catch (e) { weight = 'mixed'; }
+  return JSON.stringify([safeVal(n.strokes), weight, safeVal(n.strokeAlign), safeVal(n.strokeCap), safeVal(n.strokeJoin),
+    Array.isArray(n.dashPattern) ? n.dashPattern.join(',') : safeVal(n.dashPattern)]);
+}
+/** Variable and style bindings: switching a hex to a variable of the same colour is a change. */
+function bindSig(n) {
+  let bv;
+  try {
+    const b = n.boundVariables || {};
+    bv = Object.keys(b).sort().map(k => {
+      const v = b[k], one = x => (x && x.id) ? x.id : '';
+      return k + ':' + (Array.isArray(v) ? v.map(one).join('+') : one(v));
+    }).join(',');
+  } catch (e) { bv = ''; }
+  const id = v => { try { return safeVal(v) || ''; } catch (e) { return ''; } };
+  let modes;
+  try { modes = JSON.stringify(n.explicitVariableModes || {}); } catch (e) { modes = ''; }
+  return [bv, id(n.fillStyleId), id(n.strokeStyleId), id(n.effectStyleId), id(n.textStyleId), modes].join('|');
+}
+/** Per-run text styling: a single changed word is a change even if the node's own props don't move. */
+function textSig(n) {
+  let segs = '';
+  try {
+    if (n.getStyledTextSegments) {
+      const list = n.getStyledTextSegments(['fontName', 'fontSize', 'fontWeight', 'lineHeight', 'letterSpacing', 'fills', 'textDecoration', 'textCase']);
+      if (list) segs = list.map(x => JSON.stringify([x.characters, safeVal(x.fontName), safeVal(x.fontSize), safeVal(x.fontWeight), safeVal(x.lineHeight), safeVal(x.letterSpacing), x.fills, safeVal(x.textDecoration), safeVal(x.textCase)])).join('~');
+    }
+  } catch (e) { segs = 'unavailable'; }
+  try {
+    return n.characters + '|' + JSON.stringify([n.fontSize, n.fontName, n.lineHeight, n.letterSpacing, n.textAlignHorizontal, n.textAlignVertical, n.textAutoResize, n.paragraphSpacing, n.textTruncate].map(safeVal)) + '|' + segs;
+  } catch (e) { return ''; }
+}
+function gridSig(n) {
+  try { return n.layoutGrids ? JSON.stringify(n.layoutGrids) : ''; } catch (e) { return ''; }
+}
+function constraintSig(n) {
+  const out = [];
+  try { if (n.constraints) out.push(JSON.stringify(n.constraints)); } catch (e) { /* ignore */ }
+  ['minWidth', 'maxWidth', 'minHeight', 'maxHeight', 'layoutSizingHorizontal', 'layoutSizingVertical', 'layoutPositioning', 'itemReverseZIndex', 'clipsContent', 'isMask', 'blendMode'].forEach(k => {
+    try { if (k in n) out.push(k + '=' + safeVal(n[k])); } catch (e) { /* ignore */ }
+  });
+  return out.join(';');
+}
 function nodeSig(n) {
   const g = [round(n.x, 1), round(n.y, 1), round(n.width, 1), round(n.height, 1), n.rotation ? round(n.rotation, 1) : 0].join(',');
   let st = '';
   try {
     st = JSON.stringify([
-      'fills' in n ? safeVal(n.fills) : 0, 'strokes' in n ? n.strokes : 0, 'strokeWeight' in n ? safeVal(n.strokeWeight) : 0,
-      'effects' in n ? n.effects : 0, 'cornerRadius' in n ? safeVal(n.cornerRadius) : 0, 'opacity' in n ? n.opacity : 1, n.visible,
-      'layoutMode' in n ? [n.layoutMode, n.itemSpacing, n.paddingTop, n.paddingRight, n.paddingBottom, n.paddingLeft, n.primaryAxisAlignItems, n.counterAxisAlignItems, n.layoutWrap] : 0
+      'fills' in n ? safeVal(n.fills) : 0, strokeSig(n),
+      'effects' in n ? n.effects : 0, radiusSig(n), 'opacity' in n ? n.opacity : 1, n.visible,
+      'layoutMode' in n ? [n.layoutMode, n.itemSpacing, n.counterAxisSpacing, n.paddingTop, n.paddingRight, n.paddingBottom, n.paddingLeft, n.primaryAxisAlignItems, n.counterAxisAlignItems, n.layoutWrap, n.gridRowCount, n.gridColumnCount] : 0
     ]);
   } catch (e) { /* ignore */ }
-  let tx = '';
-  if (n.type === 'TEXT') {
-    try { tx = n.characters + '|' + JSON.stringify([n.fontSize, n.fontName, n.lineHeight, n.letterSpacing, n.textAlignHorizontal].map(safeVal)); } catch (e) { /* ignore */ }
-  }
-  return [hashStr(g), hashStr(st), tx ? hashStr(tx) : ''];
+  let meta;
+  try { meta = bindSig(n) + '#' + gridSig(n) + '#' + constraintSig(n); } catch (e) { meta = ''; }
+  const tx = n.type === 'TEXT' ? textSig(n) : '';
+  return [hashStr(g), hashStr(st + '#' + meta), tx ? hashStr(tx) : ''];
 }
 /* Compact, human-readable values stored next to the hashes so the Changes panel can
    show "before → after". Hashes stay the source of truth for *whether* something
@@ -1971,9 +2248,29 @@ function nodeVals(n) {
     if (n.visible === false) v.vis = 'hidden';
     if ('opacity' in n && n.opacity !== 1 && typeof n.opacity === 'number') v.op = Math.round(n.opacity * 100) + '%';
     if ('fills' in n && n.type !== 'TEXT') { const f = paintVal(n.fills); if (f) v.fill = f; }
-    if ('strokes' in n) { const st = paintVal(n.strokes); if (st) v.stroke = st + ' · ' + r1(n.strokeWeight); }
-    if ('cornerRadius' in n && n.cornerRadius) v.rad = isMixed(n.cornerRadius) ? [n.topLeftRadius, n.topRightRadius, n.bottomRightRadius, n.bottomLeftRadius].map(r1).join(' ') : r1(n.cornerRadius);
-    if ('effects' in n && Array.isArray(n.effects)) { const e = n.effects.filter(x => x && x.visible !== false); if (e.length) v.fx = e.map(x => String(x.type).toLowerCase().replace(/_/g, ' ') + (x.radius ? ' ' + r1(x.radius) : '')).join(', '); }
+    if ('strokes' in n) {
+      const st = paintVal(n.strokes);
+      // Per-side stroke weights are mixed: keep them readable instead of "mixed".
+      let w = '';
+      try {
+        w = isMixed(n.strokeWeight)
+          ? [n.strokeTopWeight, n.strokeRightWeight, n.strokeBottomWeight, n.strokeLeftWeight].map(r1).join(' ')
+          : r1(n.strokeWeight);
+      } catch (e) { w = 'mixed'; }
+      if (st) v.stroke = st + (w ? ' · ' + w : '');
+    }
+    if ('cornerRadius' in n && (n.cornerRadius || isMixed(n.cornerRadius))) v.rad = isMixed(n.cornerRadius) ? [n.topLeftRadius, n.topRightRadius, n.bottomRightRadius, n.bottomLeftRadius].map(r1).join(' ') : r1(n.cornerRadius);
+    if ('effects' in n && Array.isArray(n.effects)) {
+      const e = n.effects.filter(x => x && x.visible !== false);
+      if (e.length) {
+        v.fx = e.map(x => {
+          const kind = String(x.type).toLowerCase().replace(/_/g, ' ');
+          const off = (x.offset && (x.offset.x || x.offset.y)) ? 'x' + r1(x.offset.x) + ' y' + r1(x.offset.y) : '';
+          const geo = [x.radius ? r1(x.radius) : '', x.spread ? 'spread ' + r1(x.spread) : '', off].filter(Boolean).join(' ');
+          return kind + (geo ? ' ' + geo : '');
+        }).join(', ');
+      }
+    }
     if ('layoutMode' in n && n.layoutMode && n.layoutMode !== 'NONE') {
       v.lay = (n.layoutMode === 'VERTICAL' ? 'column' : n.layoutMode === 'GRID' ? 'grid' : 'row') + (n.layoutWrap === 'WRAP' ? ' wrap' : '') + ' · gap ' + (n.primaryAxisAlignItems === 'SPACE_BETWEEN' ? 'auto' : r1(n.itemSpacing)) + ' · ' + String(n.primaryAxisAlignItems || '').toLowerCase() + '/' + String(n.counterAxisAlignItems || '').toLowerCase();
       v.pad = [n.paddingTop, n.paddingRight, n.paddingBottom, n.paddingLeft].map(r1).join(' ');
@@ -2000,6 +2297,12 @@ function valDiff(a, b) {
   return out;
 }
 const SNAP_LIMIT = 2500;
+/* A layer cap alone does not bound the snapshot: 2,500 layers with text, effects
+   and fills serialise to ~1 MB, and shared plugin data is not free (Figma throttles
+   and can reject oversized writes on large files). Stop at a byte budget too, and
+   mark the snapshot partial so the panel never claims "no changes" for the layers
+   it did not see. */
+const SNAP_BYTES = 400000;
 /* Figma caps each plugin-data entry at 100 kB (enforced since March 2025), so large
    values are split across "<key>:0..n" entries. 30k UTF-16 units is < 90 kB even
    when every unit needs 3 bytes of UTF-8. */
@@ -2019,16 +2322,24 @@ function readChunked(node, key) {
   for (let i = 0; i < n; i++) out += node.getSharedPluginData(NS, key + ':' + i);
   return out;
 }
-function snapshot(root, limit) {
-  const map = {}; let count = 0;
-  (function walk(n) {
-    if (count >= limit) { map.__partial = 1; return; }
+function snapshot(root, limit, budget) {
+  const map = {}; let count = 0; let size = 0;
+  const cap = typeof budget === 'number' ? budget : SNAP_BYTES;
+  let truncated = false;
+  (function walk(n, depth) {
+    if (truncated) return;
+    if (count >= limit || size >= cap) { truncated = true; return; }
+    if (depth > MAX_DEPTH) { truncated = true; return; }
     count++;
     const s = nodeSig(n);
     const v = nodeVals(n);
-    map[n.id] = v ? [String(n.name).slice(0, 40), s[0], s[1], s[2], v] : [String(n.name).slice(0, 40), s[0], s[1], s[2]];
-    if ('children' in n) n.children.forEach(walk);
-  })(root);
+    const rec = v ? [String(n.name).slice(0, 40), s[0], s[1], s[2], v] : [String(n.name).slice(0, 40), s[0], s[1], s[2]];
+    map[n.id] = rec;
+    size += JSON.stringify(rec).length + 12; // + key, quotes and commas
+    if ('children' in n) n.children.forEach(c => walk(c, depth + 1));
+  })(root, 0);
+  // Layers past any limit are unknown, so added/removed must not be claimed.
+  if (truncated) map.__partial = 1;
   return map;
 }
 function saveBaseline(target) {
@@ -2073,7 +2384,7 @@ function diffBaseline(target) {
   } else {
     Object.keys(base).forEach(id => { if (!now[id]) changes.push({ id: null, name: base[id][0], kind: 'removed', parts: [] }); });
   }
-  const res = { at: target.getSharedPluginData(NS, 'baselineAt'), partial: partial, values: Object.keys(base).some(k => base[k] && base[k][4]), limit: SNAP_LIMIT, count: changes.length, changes: changes.slice(0, 150), containerId: target.id, containerName: target.name };
+  const res = { at: target.getSharedPluginData(NS, 'baselineAt'), partial: partial, values: Object.keys(base).some(k => base[k] && base[k][4]), limit: SNAP_LIMIT, budget: SNAP_BYTES, count: changes.length, changes: changes.slice(0, 150), containerId: target.id, containerName: target.name };
   diffCache[target.id] = res;
   return res;
 }
@@ -2087,7 +2398,7 @@ function loadMappings() {
         // file data can be written by anyone who edits the file (or another plugin): re-validate
         const m = JSON.parse(figma.root.getSharedPluginData(NS, k));
         if (m && MAP_NAME_RE.test(m.name) && MAP_PATH_RE.test(m.path)) out[k.slice(4)] = { name: m.name, path: m.path, at: String(m.at || '') };
-      } catch (e) { /* ignore */ }
+      } catch (e) { diag('component mappings', e); }
     });
   } catch (e) { /* ignore */ }
   return out;
@@ -2915,43 +3226,65 @@ function isInteractive(n) {
   } catch (e) { /* ignore */ }
   return /^(FRAME|INSTANCE|COMPONENT)$/.test(n.type) && TARGET_NAME_RE.test(n.name || '');
 }
+/** WCAG references attached to each finding, so a report can cite the rule. */
+const A11Y_RULE = { contrast: '1.4.3', size: 'readability', target: '2.5.8', label: '4.1.2' };
+/**
+ * Opacity that actually reaches a layer: Figma multiplies a layer's opacity with
+ * every ancestor's. Reading only the layer's own value makes faded content look
+ * fully opaque, which produced false "AA pass" results.
+ */
+function effectiveOpacity(node) {
+  let o = 1, c = node, guard = 0;
+  while (c && guard++ < 60) {
+    if (c.visible === false) return 0;
+    if (typeof c.opacity === 'number') o *= c.opacity;
+    if (c.opacity === 0) return 0;
+    if (c.parent && (c.parent.type === 'PAGE' || c.parent.type === 'DOCUMENT')) break;
+    c = c.parent;
+  }
+  return Math.max(0, Math.min(1, o));
+}
 function a11yAudit(root, limit) {
   const items = [];
-  let scanned = 0, limited = false;
-  const frameWidth = n => { let c = n; while (c.parent && c.parent.type !== 'PAGE' && c.parent.type !== 'DOCUMENT' && c.parent.type !== 'SECTION') c = c.parent; return c.width || 9999; };
-  const visit = n => {
+  let scanned = 0, limited = false, depthLimited = false;
+  const frameWidth = n => { let c = n, g = 0; while (c.parent && g++ < 60 && c.parent.type !== 'PAGE' && c.parent.type !== 'DOCUMENT' && c.parent.type !== 'SECTION') c = c.parent; return c.width || 9999; };
+  const visit = (n, depth) => {
     if (n.visible === false) return;
     if (scanned >= (limit || 400)) { limited = true; return; }
+    if (depth > MAX_DEPTH) { depthLimited = true; return; }
     scanned++;
     if (n.type === 'TEXT' && n.characters && String(n.characters).trim()) {
       const fg = textFill(n), size = isMixed(n.fontSize) ? 16 : n.fontSize;
       const weight = isMixed(n.fontWeight) ? 400 : (n.fontWeight || 400);
-      if (fg && !fg.unknown) {
+      const op = effectiveOpacity(n);
+      if (fg && !fg.unknown && op > 0.005) {
         const bg = backgroundBehind(n);
         if (bg && !bg.unknown) {
-          const a = Math.min(1, fg.alpha * (n.opacity === undefined ? 1 : n.opacity));
+          const a = Math.min(1, fg.alpha * op);
           const eff = blendOver(fg.color, a, bg.color);
           const ratio = contrastRatio(eff, bg.color);
           const large = size >= 24 || (size >= 18.66 && weight >= 700);
           const need = large ? 3 : 4.5, aaa = large ? 4.5 : 7;
-          items.push({ id: n.id, name: String(n.characters).slice(0, 40), kind: 'contrast', status: ratio >= need ? 'pass' : 'fail', ratio: round(ratio, 2), need: need, aaa: ratio >= aaa, large: large,
-            fg: colorHex(eff), bg: colorHex(bg.color), assumed: bg.assumed, size: size });
-        } else items.push({ id: n.id, name: String(n.characters).slice(0, 40), kind: 'contrast', status: 'unknown', detail: 'Background is a ' + String(bg && bg.unknown || 'gradient/image').toLowerCase() + ' — check contrast manually' });
+          const faded = op < 0.995;
+          items.push({ rule: A11Y_RULE.contrast, id: n.id, name: String(n.characters).slice(0, 40), kind: 'contrast', status: ratio >= need ? 'pass' : 'fail', ratio: round(ratio, 2), need: need, aaa: ratio >= aaa, large: large,
+            fg: colorHex(eff), bg: colorHex(bg.color), assumed: bg.assumed, confidence: bg.assumed ? 'assumed' : 'measured', opacity: round(op, 2), size: size,
+            detail: faded ? 'Reduced to ' + Math.round(op * 100) + '% opacity by a parent layer' : '' });
+        } else items.push({ rule: A11Y_RULE.contrast, id: n.id, name: String(n.characters).slice(0, 40), kind: 'contrast', status: 'unknown', confidence: 'unknown', detail: 'Background is a ' + String(bg && bg.unknown || 'gradient/image').toLowerCase() + ' — check contrast manually' });
       }
-      if (size < 12) items.push({ id: n.id, name: String(n.characters).slice(0, 40), kind: 'size', status: 'warn', detail: 'Text is ' + round(size, 1) + 'px — under 12px is hard to read' });
+      if (size < 12) items.push({ rule: A11Y_RULE.size, id: n.id, name: String(n.characters).slice(0, 40), kind: 'size', status: 'warn', confidence: 'measured', detail: 'Text is ' + round(size, 1) + 'px — under 12px is hard to read' });
     }
     if (n !== root && isInteractive(n) && 'width' in n) {
       const w = n.width, h = n.height, min = Math.min(w, h), mobile = frameWidth(n) <= 600;
-      if (min < 24) items.push({ id: n.id, name: n.name, kind: 'target', status: 'fail', w: round(w), h: round(h), detail: round(w) + '×' + round(h) + ' is under the 24×24 minimum (WCAG 2.5.8)' });
-      else if (mobile && min < 44) items.push({ id: n.id, name: n.name, kind: 'target', status: 'warn', w: round(w), h: round(h), detail: round(w) + '×' + round(h) + ' — aim for 44×44 on touch screens' });
-      else items.push({ id: n.id, name: n.name, kind: 'target', status: 'pass', w: round(w), h: round(h), detail: round(w) + '×' + round(h) });
+      if (min < 24) items.push({ rule: A11Y_RULE.target, id: n.id, name: n.name, kind: 'target', status: 'fail', confidence: 'measured', w: round(w), h: round(h), detail: round(w) + '×' + round(h) + ' is under the 24×24 minimum (WCAG 2.5.8)' });
+      else if (mobile && min < 44) items.push({ rule: A11Y_RULE.target, id: n.id, name: n.name, kind: 'target', status: 'warn', confidence: 'measured', w: round(w), h: round(h), detail: round(w) + '×' + round(h) + ' — aim for 44×44 on touch screens' });
+      else items.push({ rule: A11Y_RULE.target, id: n.id, name: n.name, kind: 'target', status: 'pass', confidence: 'measured', w: round(w), h: round(h), detail: round(w) + '×' + round(h) });
       let hasText = true;
       try { hasText = !!(n.findOne && n.findOne(x => x.type === 'TEXT' && x.visible !== false && String(x.characters || '').trim())); } catch (e) { /* assume labelled */ }
-      if (!hasText && 'children' in n) items.push({ id: n.id, name: n.name, kind: 'label', status: 'warn', detail: 'No visible text — give it an accessible name (aria-label / contentDescription)' });
+      if (!hasText && 'children' in n) items.push({ rule: A11Y_RULE.label, id: n.id, name: n.name, kind: 'label', status: 'warn', confidence: 'inferred', detail: 'No visible text — give it an accessible name (aria-label / contentDescription)' });
     }
-    if ('children' in n) n.children.forEach(visit);
+    if ('children' in n) n.children.forEach(c => visit(c, depth + 1));
   };
-  visit(root);
+  visit(root, 0);
   const counts = { fail: 0, warn: 0, pass: 0, unknown: 0 };
   items.forEach(i => { counts[i.status]++; });
   const order = { fail: 0, warn: 1, unknown: 2, pass: 3 };
@@ -2968,7 +3301,7 @@ function a11yAudit(root, limit) {
       : [it.kind, it.status, it.detail || ''].join('|');
     const g = byKey[key];
     if (!g) {
-      byKey[key] = { key: key, kind: it.kind, status: it.status, count: 1, ids: [it.id], item: it };
+      byKey[key] = { key: key, rule: it.rule, kind: it.kind, status: it.status, count: 1, ids: [it.id], item: it };
       groups.push(byKey[key]);
       return;
     }
@@ -2976,7 +3309,9 @@ function a11yAudit(root, limit) {
     if (g.ids.length < 50) g.ids.push(it.id);
   });
   groups.sort((a, b) => order[a.status] - order[b.status] || b.count - a.count);
-  return { items: items.slice(0, 120), groups: groups.slice(0, 120), counts: counts, scanned: scanned, limited: limited };
+  const byRule = {};
+  items.forEach(i => { byRule[i.rule] = (byRule[i.rule] || 0) + (i.status === 'fail' ? 1 : 0); });
+  return { items: items.slice(0, 120), groups: groups.slice(0, 120), counts: counts, byRule: byRule, scanned: scanned, limited: limited, depthLimited: depthLimited };
 }
 
 /* ------------------------------------------------------------------ */
@@ -2989,30 +3324,58 @@ function safeVarName(web, path) {
   const m = web && /var\((--[A-Za-z0-9_-]+)/.exec(web);
   return m ? m[1] : '--' + cssIdent(path);
 }
+/**
+ * Walks alias → alias → … so a token can fall back to the first target that is
+ * actually part of the export. A single-step lookup produced `var(--x)` for `--x`
+ * that belonged to a hidden variable or another file — valid CSS naming an
+ * undefined custom property, which renders as nothing.
+ */
+async function aliasChain(raw, modeId) {
+  const names = [];
+  let cur = raw;
+  for (let depth = 0; depth < 8; depth++) {
+    if (!cur || typeof cur !== 'object' || cur.type !== 'VARIABLE_ALIAS') break;
+    let v = null;
+    try { v = await figma.variables.getVariableByIdAsync(cur.id); } catch (e) { /* unavailable target */ }
+    if (!v) return names; // the target lives outside this file: chain stops here
+    names.push(v.name);
+    const coll = await getColl(v.variableCollectionId);
+    const mid = v.valuesByMode[modeId] !== undefined ? modeId : coll ? coll.defaultModeId : Object.keys(v.valuesByMode || {})[0];
+    cur = v.valuesByMode[mid];
+  }
+  return names;
+}
 async function tokenFromVariable(v) {
   const coll = await getColl(v.variableCollectionId);
-  const modes = coll ? coll.modes : [{ modeId: Object.keys(v.valuesByMode)[0], name: 'Default' }];
-  const defId = coll ? coll.defaultModeId : modes[0].modeId;
+  const fallbackMode = Object.keys(v.valuesByMode || {})[0];
+  const modes = coll && coll.modes && coll.modes.length ? coll.modes : [{ modeId: fallbackMode, name: 'Default' }];
+  const defId = (coll && coll.defaultModeId) || modes[0].modeId;
   const path = String(v.name).split('/').map(s => s.trim()).filter(Boolean);
-  const tok = { source: 'variable', name: v.name, path: path, type: v.resolvedType, collection: coll ? coll.name : '', description: v.description || '', web: (v.codeSyntax && v.codeSyntax.WEB) || '', modes: [] };
+  const tok = { source: 'variable', name: v.name, path: path, type: v.resolvedType, collection: coll ? coll.name : '', remote: !!(coll && coll.remote), description: v.description || '', web: (v.codeSyntax && v.codeSyntax.WEB) || '', modes: [] };
   for (const m of modes) {
     const raw = v.valuesByMode[m.modeId];
     const r = await resolveVarValue(raw, m.modeId, 0);
-    let ref = null;
-    if (raw && typeof raw === 'object' && raw.type === 'VARIABLE_ALIAS') {
-      try { const t = await figma.variables.getVariableByIdAsync(raw.id); ref = t ? t.name : null; } catch (e) { /* ignore */ }
-    }
-    tok.modes.push({ name: m.name, isDefault: m.modeId === defId, value: r.value, ref: ref });
+    const chain = raw && typeof raw === 'object' && raw.type === 'VARIABLE_ALIAS' ? await aliasChain(raw, m.modeId) : [];
+    const mode = { name: m.name, isDefault: m.modeId === defId, value: r.value, ref: chain.length ? chain[0] : null };
+    if (chain.length > 1) mode.refChain = chain;
+    if (r.cycle) mode.cycle = true;
+    if (r.value === null || r.value === undefined) mode.unresolved = true;
+    tok.modes.push(mode);
   }
   return tok;
 }
 function walkTree(node, fn, limit) {
   let n = 0;
-  (function go(x) { if (n++ >= limit) return; fn(x); if ('children' in x) x.children.forEach(go); })(node);
+  (function go(x, depth) {
+    if (n++ >= limit || depth > MAX_DEPTH) return;
+    fn(x);
+    if ('children' in x) x.children.forEach(c => go(c, depth + 1));
+  })(node, 0);
 }
 async function gatherTokens(scope, node) {
   const tokens = [];
   const seen = {};
+  let libraryCount = 0;
   const add = async v => {
     if (!v || seen[v.id] || v.hiddenFromPublishing) return;
     seen[v.id] = 1;
@@ -3025,8 +3388,28 @@ async function gatherTokens(scope, node) {
     for (const id of Object.keys(ctx.varIds)) { let v = null; try { v = await figma.variables.getVariableByIdAsync(id); } catch (e) { /* remote */ } await add(v); }
   } else {
     let list = [];
-    try { list = await figma.variables.getLocalVariablesAsync(); } catch (e) { /* unavailable */ }
+    try { list = await figma.variables.getLocalVariablesAsync(); } catch (e) { diag('local variables', e); }
     for (const v of list.slice(0, 2000)) await add(v);
+    // A design system usually lives in a library: those variables are part of the
+    // file's tokens even though the file does not own them. Bounded, and silently
+    // skipped on Figma builds without the API.
+    let library = 0;
+    const lib = figma.variables.getVariablesInLibraryCollectionAsync;
+    if (lib) {
+      let colls = [];
+      try { colls = await figma.variables.getAvailableLibraryVariableCollectionsAsync(); } catch (e) { diag('library collections', e); }
+      for (const c of (colls || []).slice(0, 8)) {
+        if (!c) continue;
+        let vars = [];
+        try { vars = await lib.call(figma.variables, c.key || c.id); } catch (e) { diag('library variables', e); }
+        for (const v of (vars || []).slice(0, 600)) {
+          if (library >= 500) break;
+          await add(v);
+          library++;
+        }
+      }
+    }
+    libraryCount = library;
   }
   const styles = { paint: [], text: [] };
   if (scope !== 'selection') {
@@ -3046,10 +3429,23 @@ async function gatherTokens(scope, node) {
       });
     } catch (e) { /* unavailable */ }
   }
-  return { tokens: tokens, styles: styles };
+  return { tokens: tokens, styles: styles, library: libraryCount };
 }
-function tokenValue(tok, mode, nameOf, unit, base) {
-  if (mode.ref) return 'var(' + nameOf(mode.ref) + ')';
+/**
+ * Name to reference for an aliased value, or '' when no target in the chain is
+ * part of this export (then the literal value is written instead).
+ */
+function refName(mode, nameOf, known) {
+  const chain = mode.refChain || (mode.ref ? [mode.ref] : []);
+  for (const n of chain) {
+    if (!n) continue;
+    if (!known || known(n)) return nameOf(n);
+  }
+  return '';
+}
+function tokenValue(tok, mode, nameOf, unit, base, known) {
+  const ref = refName(mode, nameOf, known);
+  if (ref) return 'var(' + ref + ')';
   const hint = tok.type === 'FLOAT' && !UNITLESS_RE.test(tok.name) ? 'px' : '';
   if (tok.type === 'STRING') return mode.value === null || mode.value === undefined ? null : cssStr(mode.value);
   const v = varValueCss(mode.value, tok.type, hint);
@@ -3081,8 +3477,9 @@ function jsonSet(root, path, leaf) {
   const last = path[path.length - 1];
   o[o[last] && o[last].$value === undefined && o[last] ? last + '-default' : last] = leaf;
 }
-function jsonValue(tok, mode, unit, base, refPath) {
-  if (mode.ref) return '{' + refPath(mode.ref) + '}';
+function jsonValue(tok, mode, unit, base, refPath, known) {
+  const ref = refName(mode, refPath, known);
+  if (ref) return '{' + ref + '}';
   if (tok.type === 'COLOR') return varValueCss(mode.value, 'COLOR');
   if (tok.type === 'FLOAT') return UNITLESS_RE.test(tok.name) ? mode.value : remify(round(mode.value, 2) + 'px', unit, base);
   return mode.value;
@@ -3095,9 +3492,17 @@ async function buildTokens(format, scope, node, unit, base) {
   const nameOf = format === 'tailwind'
     ? n => byName[n] ? twName(byName[n]) : '--' + cssIdent(String(n).split('/'))
     : n => byName[n] ? safeVarName(byName[n].web, byName[n].path) : '--' + cssIdent(String(n).split('/'));
-  const when = scope === 'selection' ? 'tokens used by the selection' : 'all local variables and styles';
-  const stats = { variables: toks.length, styles: data.styles.paint.length + data.styles.text.length, modes: 0 };
-  const head = 'Design tokens — exported from Figma by DevReady (' + when + ')';
+  // An alias may only become `var(--x)` / `{x.y}` when `--x` is in this export.
+  const known = n => !!(byName[n] && byName[n].path && byName[n].path.length);
+  const aliases = toks.filter(t => t.modes.some(m => m.ref)).length;
+  const unresolved = toks.filter(t => t.modes.some(m => m.unresolved)).length;
+  const library = data.library || 0;
+  const when = scope === 'selection'
+    ? 'tokens used by the selection'
+    : 'all local variables and styles' + (library ? ' plus ' + library + ' published library variable' + (library === 1 ? '' : 's') : '');
+  const stats = { variables: toks.length, styles: data.styles.paint.length + data.styles.text.length, modes: 0, aliases: aliases, library: library, unresolved: unresolved };
+  const head = 'Design tokens — exported from Figma by DevReady (' + when + ')' +
+    (unresolved ? ' · ' + unresolved + ' token' + (unresolved === 1 ? '' : 's') + ' could not be resolved in this file' : '');
   let text;
   const modeNames = {};
   toks.forEach(t => t.modes.forEach(m => { if (!m.isDefault) modeNames[t.collection + '|' + m.name] = 1; }));
@@ -3109,13 +3514,18 @@ async function buildTokens(format, scope, node, unit, base) {
     toks.forEach(t => {
       const def = t.modes.find(m => m.isDefault) || t.modes[0];
       if (!def || !t.path.length) return;
-      const v = jsonValue(t, def, unit, base, refPath);
-      if (v === null || v === undefined) return;
+      const v = jsonValue(t, def, unit, base, refPath, known);
+      if (v === null || v === undefined) {
+        // Value could not be resolved (remote variable the file cannot read).
+        // Keep the token so the consumer sees it exists, flagged rather than missing.
+        jsonSet(root, t.path, { $type: 'string', $value: null, $description: t.description || 'Unresolved in Figma — read the variable in the design file.' });
+        return;
+      }
       const leaf = { $type: t.type === 'COLOR' ? 'color' : t.type === 'FLOAT' ? (UNITLESS_RE.test(t.name) ? 'number' : 'dimension') : 'string', $value: v };
       if (t.description) leaf.$description = t.description;
       const others = t.modes.filter(m => !m.isDefault);
       leaf.$extensions = { 'com.figma': { collection: t.collection } };
-      if (others.length) { leaf.$extensions['com.figma'].modes = {}; others.forEach(m => { const mv = jsonValue(t, m, unit, base, refPath); if (mv !== null && mv !== undefined) leaf.$extensions['com.figma'].modes[m.name] = mv; }); }
+      if (others.length) { leaf.$extensions['com.figma'].modes = {}; others.forEach(m => { const mv = jsonValue(t, m, unit, base, refPath, known); if (mv !== null && mv !== undefined) leaf.$extensions['com.figma'].modes[m.name] = mv; }); }
       jsonSet(root, t.path, leaf);
     });
     data.styles.paint.forEach(s => { if (s.path.length) jsonSet(root, ['style'].concat(s.path), { $type: 'color', $value: varValueCss(s.color, 'COLOR') }); });
@@ -3134,12 +3544,12 @@ async function buildTokens(format, scope, node, unit, base) {
     toks.forEach(t => {
       const def = t.modes.find(m => m.isDefault) || t.modes[0];
       if (!def) return;
-      const v = tokenValue(t, def, n => sn(n), unit, base);
+      const v = tokenValue(t, def, n => sn(n), unit, base, known);
       if (v === null) return;
       const name = sn(t.name);
       lines.push(name + ': ' + v.replace(/var\((\$[^)]+)\)/g, '$1') + ';');
       t.modes.filter(m => !m.isDefault).forEach(m => {
-        const mv = tokenValue(t, m, n => sn(n), unit, base);
+        const mv = tokenValue(t, m, n => sn(n), unit, base, known);
         if (mv !== null && mv !== v) lines.push(name + '--' + slug(m.name) + ': ' + mv.replace(/var\((\$[^)]+)\)/g, '$1') + ';');
       });
     });
@@ -3162,11 +3572,11 @@ async function buildTokens(format, scope, node, unit, base) {
       const def = t.modes.find(m => m.isDefault) || t.modes[0];
       if (!def) return;
       const name = nameOf(t.name);
-      const v = tokenValue(t, def, nameOf, unit, base);
+      const v = tokenValue(t, def, nameOf, unit, base, known);
       if (v === null) return;
       root.push('  ' + name + ': ' + v + ';');
       t.modes.filter(m => !m.isDefault).forEach(m => {
-        const mv = tokenValue(t, m, nameOf, unit, base);
+        const mv = tokenValue(t, m, nameOf, unit, base, known);
         if (mv === null || mv === v) return;
         const sel = themeSelector(t.collection, m.name, t.modes);
         (themes[sel] = themes[sel] || []).push('  ' + name + ': ' + mv + ';');
@@ -3410,8 +3820,7 @@ if (figma.mode === 'codegen') {
       if (status) { const cont = await figma.getNodeByIdAsync(status.nodeId); const d = cont && diffBaseline(cont); if (d && d.count) header += ' · ⚠ ' + d.count + ' change' + (d.count > 1 ? 's' : '') + ' since ready'; }
     } catch (e) { /* ignore */ }
     const out = await generateCode(node, event.language, unit, base, 150, { inlineBudget: 400 * 1024, fastFonts: true });
-    const LANG = { html: 'HTML', vue: 'HTML', svelte: 'HTML', css: 'CSS', jsx: 'JAVASCRIPT', swift: 'SWIFT', kotlin: 'KOTLIN', dart: 'PLAINTEXT', text: 'PLAINTEXT' };
-    const res = out.files.map((f, i) => ({ title: (i === 0 ? header + '  ·  ' : '') + f.name, language: LANG[f.lang] || 'PLAINTEXT', code: f.code }));
+    const res = out.files.map((f, i) => ({ title: (i === 0 ? header + '  ·  ' : '') + f.name, language: CODEGEN_LANG[f.lang] || 'PLAINTEXT', code: f.code }));
     if (out.assets.length) res.push({ title: 'Assets (export from the DevReady panel → Download project)', language: 'PLAINTEXT', code: out.assets.map(a => 'assets/' + a.file + (a.scale > 1 ? '  (@' + a.scale + 'x)' : '')).join('\n') });
     return res;
   });
@@ -3430,8 +3839,9 @@ if (figma.mode === 'codegen') {
 
   async function refresh() {
     const my = ++reqId;
+    clearDiagnostics(); // notes describe this pass only
     const sel = figma.currentPage.selection;
-    const base = { editor: figma.editorType, isDev: IS_DEV, settings: settings };
+    const base = { editor: figma.editorType, isDev: IS_DEV, settings: settings, limits: { maxDepth: MAX_DEPTH, snapLimit: SNAP_LIMIT, a11yLimit: 400 } };
 
     if (!sel.length) {
       lastSegments = [];
@@ -3442,7 +3852,10 @@ if (figma.mode === 'codegen') {
 
     const node = sel[0];
     const status = findDevStatus(node);
-    const target = markTarget(node);
+    const targets = statusTargets(node);
+    // Where a status would go, and whether Figma itself can hold it. The panel
+    // uses this to explain why a group needs the DevReady flag instead.
+    const targetInfo = targets.flag ? { id: targets.flag.id, name: targets.flag.name, type: targets.flag.type, native: !!targets.native } : null;
 
     if (settings.gate === 'strict' && !status) {
       lastSegments = [];
@@ -3450,8 +3863,9 @@ if (figma.mode === 'codegen') {
       post(Object.assign({
         type: 'state', mode: 'locked',
         node: { id: node.id, name: node.name, type: node.type },
-        target: target ? { id: target.id, name: target.name, type: target.type } : null,
-        ready: listReady()
+        target: targetInfo,
+        ready: listReady(),
+        diagnostics: takeDiagnostics()
       }, base));
       return;
     }
@@ -3473,7 +3887,7 @@ if (figma.mode === 'codegen') {
       try {
         const cont = await figma.getNodeByIdAsync(status.nodeId);
         if (cont) changes = diffBaseline(cont) || { none: true, containerId: cont.id, containerName: cont.name };
-      } catch (e) { /* ignore */ }
+      } catch (e) { diag('change history', e); }
     }
     if (my !== reqId) return;
 
@@ -3489,14 +3903,15 @@ if (figma.mode === 'codegen') {
       type: 'state', mode: 'inspect',
       count: sel.length,
       status: status,
-      target: target ? { id: target.id, name: target.name, type: target.type } : null,
+      target: targetInfo,
       spec: spec,
       css: groupedCSS(css, settings.unit, settings.remBase, spec.text && spec.text.segments[0] ? spec.text.segments[0].styleName : null),
       tailwind: cssToTailwind(css, settings.unit, settings.remBase).join(' '),
       measure: measure,
       changes: changes,
       a11y: a11y,
-      assets: assets
+      assets: assets,
+      diagnostics: takeDiagnostics()
     }, base));
 
     // Thumbnails (only when the selection itself changes, not on every edit)
@@ -3521,8 +3936,25 @@ if (figma.mode === 'codegen') {
     timer = setTimeout(() => { timer = null; refresh().catch(err => post({ type: 'error', message: String(err && err.message || err) })); }, typeof delay === 'number' ? delay : 120);
   }
 
+  // One listener per page, not one per page switch: without detaching, switching
+  // pages 30 times leaves 30 handlers running the same refresh.
+  let watchedPage = null;
+  let watchedHandler = null;
   function watchPage() {
-    try { figma.currentPage.on('nodechange', () => { Object.keys(diffCache).forEach(k => { diffCache[k] = null; }); schedule(400); }); } catch (e) { /* ignore */ }
+    try {
+      if (watchedPage && watchedHandler && typeof watchedPage.off === 'function') watchedPage.off('nodechange', watchedHandler);
+    } catch (e) { /* older Figma */ }
+    watchedPage = figma.currentPage;
+    watchedHandler = null;
+    try {
+      watchedHandler = function () {
+        // A variable/style rename or an edit inside a baseline container must be
+        // visible on the next refresh, so drop the lookup caches with the diffs.
+        clearLookupCaches();
+        schedule(400);
+      };
+      watchedPage.on('nodechange', watchedHandler);
+    } catch (e) { /* ignore */ }
   }
 
   figma.on('selectionchange', () => schedule(80));
@@ -3558,9 +3990,10 @@ if (figma.mode === 'codegen') {
         case 'mark': {
           const r = await setReady(msg.id, msg.status, msg.note);
           if (r.ok) {
-            figma.notify(msg.status
-              ? (r.native ? '🟢 "' + r.name + '" marked Ready for dev' : '🟢 "' + r.name + '" flagged ready (plugin flag)')
-              : '"' + r.name + '" status cleared');
+            if (msg.status) {
+              const label = r.name + (msg.status === 'COMPLETED' ? ' marked Completed' : ' marked Ready for dev');
+              figma.notify(r.native ? '🟢 ' + label : '🟢 ' + r.name + ' flagged ready (Figma status not available on this layer type or plan)');
+            } else figma.notify('"' + r.name + '" status cleared');
           } else figma.notify(r.error, { error: true });
           schedule();
           break;
@@ -3594,15 +4027,25 @@ if (figma.mode === 'codegen') {
         case 'gen-code': {
           const sel = figma.currentPage.selection;
           const node = msg.nodeId ? await figma.getNodeByIdAsync(msg.nodeId) : sel[0];
-          if (!node) break;
+          // Always answer: a deleted layer used to leave the panel on "Building…"
+          // forever, because the request was never resolved either way.
+          if (!node) {
+            post({ type: 'code', lang: msg.lang, requestId: msg.requestId || '', nodeId: msg.nodeId || '', out: {
+              files: [{ name: 'error.txt', lang: 'text', code: 'That layer no longer exists — select another layer and try again.' }],
+              assets: [], fonts: [], preview: { w: 0, h: 0, inlinedKB: 0 }, truncated: false, assetErrors: [],
+              stats: { layers: 0, classes: 0, assets: 0, tokens: 0, modes: 0, mapped: 0 }
+            } });
+            break;
+          }
           const out = await generateCode(node, msg.lang, settings.unit, settings.remBase, 600);
           post({ type: 'code', lang: msg.lang, requestId: msg.requestId || '', nodeId: node.id, out: out });
           break;
         }
         case 'tokens-export': {
           const sel = figma.currentPage.selection;
+          clearDiagnostics();
           const out = await buildTokens(msg.format, msg.scope, sel[0] || null, settings.unit, settings.remBase);
-          post({ type: 'tokens', format: msg.format, scope: msg.scope, out: out });
+          post({ type: 'tokens', format: msg.format, scope: msg.scope, out: out, diagnostics: takeDiagnostics() });
           break;
         }
         case 'design-shot': {

@@ -14,8 +14,29 @@ All notable changes to DevReady are listed here. The format follows [Keep a Chan
 - **Mixed absolute and auto-layout siblings keep Figma's paint order.** Bottom bars remain above earlier overlapping rows, including reversed auto-layout stacking.
 - **Wrapped Auto text has deterministic web line-height.** Compatible uniform text uses Figma's SVG baseline spacing; native targets keep their platform font metrics rather than receiving an inferred cross-platform line box.
 
+- **Design tokens survive real design systems.** An alias is followed through its whole
+  chain, so `--color-text: var(--core-ink)` no longer points at a variable that is hidden
+  or belongs to another file; when no target is exported the literal value is written
+  instead of `var(--undefined)`. Published **library** variables are part of the export,
+  unreadable values are kept and flagged (`$value: null` in DTCG, "could not be resolved"
+  in the header) and a cyclic alias terminates instead of writing `undefined`.
+- **A failed Figma read is no longer silent.** Calls whose errors were swallowed by empty
+  `catch` blocks — local variables, library collections, variable modes, font availability,
+  component mappings — leave a bounded, de-duplicated note that the panel shows as
+  “Limited data”, and that travels with the token export that triggered it.
+- **Snapshots have a byte budget, not only a layer cap.** 2,500 text-heavy layers serialise
+  to about a megabyte of shared plugin data; the snapshot now stops at 400,000 characters
+  and marks itself partial, so the Changes panel never claims “no changes” for layers it
+  did not read.
+- **Static HTML announces the design's language.** `lang` and `dir="rtl"` are derived from
+  the actual text (Arabic, Hebrew, Devanagari, Thai, Japanese, Korean, Chinese, Cyrillic),
+  instead of hard-coding `lang="en"` on every export.
+
 ### Added
-- Fourteen codegen-fidelity and follow-up regressions covering these cases (**158 checks total**).
+- A second hardening suite: 34 regressions for token aliases and libraries, degraded-read
+  diagnostics, the snapshot budget, document language/direction and parser-level SVG
+  evasion, plus direct unit tests for the panel's helpers and its ZIP writer
+  (**192 checks total**).
 
 ## [1.5.1] — 2026-10-20
 

@@ -83,6 +83,7 @@
         "react-ts",
         "react-tailwind-ts",
         "html-css",
+        "html-single",
         "vue",
         "svelte"
       ]
@@ -108,8 +109,13 @@
         "react-ts",
         "react-tailwind-ts",
         "html-css",
+        "html-single",
         "vue",
-        "svelte"
+        "svelte",
+        "react-native",
+        "swiftui",
+        "compose",
+        "flutter"
       ]
     }
   ],
