@@ -176,10 +176,10 @@ function loadEngine(B, options) {
   const sandbox = {
     figma, __html__: '', console,
     setTimeout, clearTimeout, Promise, Uint8Array, TextEncoder, TextDecoder,
-    fetch: async url => {
+    fetch: async (url, init) => {
       fetched.push(String(url));
       if (!options.fetch) throw new Error('offline (test default)');
-      return options.fetch(String(url));
+      return options.fetch(String(url), init || {});
     }
   };
   vm.createContext(sandbox);

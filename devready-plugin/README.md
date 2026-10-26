@@ -169,10 +169,47 @@ What the plugin does now:
 - **Ready list**: with nothing selected, it lists every ready or completed design on the page. Click one to jump to it.
 - **Settings** (saved per user): gate on/off, accept the team flag, px/rem, rem base, HEX/RGB/HSL
 
+## Workspace, vector illustrations and GitHub
+
+The panel has a tab bar. **Design** is the original inspector (unchanged); the other tabs
+are workspace surfaces:
+
+| Tab | Contents |
+|---|---|
+| **Overview** | Current selection, layer count, depth, cost estimate, warnings, recent activity, and the project list (search, sort, archive). |
+| **Design Files** | The design entries of the active project with per-file status. *Generate all* runs them one at a time with a progress meter; *Retry N failed* re-runs failures only; *Cancel* stops the queue. |
+| **Code** | Files from the last run with sizes, per-file and ZIP download, warnings, and links to history and publishing. |
+| **Assets** | Search, type filter, 8 rows with *Show all N* / *Show less*, thumbnails for visible rows, per-asset and bulk export. |
+| **History** | Local revisions: compare (added / removed / changed / unchanged, line diff) and restore with a confirmation. |
+| **GitHub** | Connect a token, list or create repositories, pick a branch, preview added/modified/unchanged/deleted files, choose files, commit. |
+| **Settings** | Gate, units, rem base, colours, fonts, **vector illustrations**, limits, disconnect, clear local data. |
+
+Projects, entries and revisions live in `figma.clientStorage` on this machine (200 kB per
+key), not in the file — nothing is shared with collaborators.
+
+**Vector illustrations.** A self-contained artwork frame is exported as **one SVG** and
+referenced like an image instead of being rebuilt element by element. The heuristic needs
+all of: a vector-only subtree (no text, no instances, no raster fills) *and* one of — an
+SVG export setting, an artwork-like name (`illustration`, `logo`, `artwork`, `mascot`, …),
+or a dense composition (≥ 30 shapes). `Settings → Vector illustrations` has three levels:
+*Automatic*, *Named or SVG-exported only*, and *Never*. Everything Figma considers UI —
+forms, buttons, navs, cards with text — is generated as code exactly as before, and a
+failed SVG export falls back to element-by-element output with a note in the panel.
+Exported SVG is sanitised (`cleanSvg`): scripts, event handlers, external references,
+remote `url()` and `@import` are rejected; local `url(#gradient)` and `<use href="#id">` are kept.
+
+**Limits, cost and cancellation.** Before generating, `assessComplexity()` walks up to
+6,000 layers and reports layers, depth, text, vectors, instances, images and an estimated
+cost, with warnings when a run will be truncated. Layers described per selection: 6,000;
+layers per generation: 2,500; asset walk: 2,000 layers / 400 assets; panel code timeout:
+20 s; local storage: 200 kB per key; projects: 20; revisions: 8. A run carries a job id:
+**Cancel** stops it at the next layer boundary and answers `cancelled`, so the panel never
+sits on “Building…”.
+
 ## Files
 - `manifest.json`: editor types, capabilities (inspect + codegen + vscode), codegen languages and preferences
 - `code.js`: plugin logic (gate, spec extraction, variable modes, change tracking, Code Connect mapping, CSS→Tailwind, tree code generation for all twelve targets, assets, native measurements, annotations, dev resources, codegen). Section map: [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md)
-- `ui.html`: the panel UI, styled after Figma Dev Mode's Inspect panel (UI3 look, follows Figma's light/dark theme). If you open it in a normal browser, it shows sample data.
+- `ui.html`: the panel UI — the tab bar plus the Inspect panel, styled after Figma Dev Mode (UI3 look, follows Figma's light/dark theme). If you open it in a normal browser, it shows sample data.
 
 ## Notes and limits
 - If Figma rejects the manifest on import, remove `"codegen"` from `capabilities` and delete the `codegenLanguages` and `codegenPreferences` blocks. The inspector will still work.
@@ -182,7 +219,7 @@ What the plugin does now:
 - Code Connect mapping affects React output only. SwiftUI and Compose still rebuild the component from its layers.
 - Plugins can't do the following, so Dev Mode still does them better: hover-to-measure on the canvas, version comparison, notifications when designs change, and VS Code's built-in "Figma for VS Code" integration.
 - Full-tree code stops after 600 layers in the panel (1,500 for Download project) and 150 in Dev Mode's Code section, because Figma gives code generation only a 3-second time limit.
-- **The plugin code makes no network requests.** The only traffic is the HTML preview loading **public Google Fonts** (family + weights from the bundled catalog) from `fonts.googleapis.com` / `fonts.gstatic.com`. Turn it off with ⋯ → **Load Google Fonts in preview**. Private, commercial and system font names are never sent, and no layer names, text, images or file data leave Figma. See [PRIVACY.md](../PRIVACY.md) and `npm test`.
+- **Two optional network paths, nothing else.** (1) The HTML preview may load **public Google Fonts** (family + weights from the bundled catalog) from `fonts.googleapis.com` / `fonts.gstatic.com`; turn it off with ⋯ → **Load Google Fonts in preview**. (2) **GitHub publishing**, which runs only after you connect a token and confirm a preview. Private, commercial and system font names are never sent, and no layer names, text, images or file data leave Figma unless you push generated code. See [PRIVACY.md](../PRIVACY.md) and [PUBLISHING.md](../docs/PUBLISHING.md).
 - The preview iframe is sandboxed without scripts and locked down by a Content-Security-Policy. Every message from the panel to the plugin is validated. See [SECURITY.md](../SECURITY.md).
 - Before you publish, replace `"id"` in `manifest.json` with the ID Figma gives you.
 
@@ -193,6 +230,11 @@ From the repo root: `npm ci && npm run verify` (layout, Figma sandbox check, ESL
 - message validation and mapping injection;
 - change tracking (100 kB limit, before → after values);
 - that the plugin code makes no network requests.
+
+It also covers the workspace: illustration vs UI classification, complexity limits,
+cancellation, the GitHub adapter against a mocked API (connect, rate limits, permissions,
+network loss, retry policy, commit sequence, stale base, rejected ref, unsafe paths), local
+storage bounds, tab rendering, the per-file queue and project management.
 
 Two further groups test the output itself: **golden files** (`tests/golden/`, four fixture × target pairs) fail with a one-line diff when generated code drifts — accept a deliberate change with `npm test -- --update-golden` — and the **generated React project is bundled with esbuild**, so every import it emits must resolve.
 

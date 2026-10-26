@@ -5,6 +5,35 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>DevReady Inspect</title>
 <style>
+  /* ---------- workspace: tabs, cards, lists ---------- */
+  .tabs { display: flex; gap: 2px; padding: 0 8px; border-bottom: 1px solid var(--border); background: var(--bg); flex: 0 0 auto; overflow-x: auto; scrollbar-width: none; }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab { border: 0; background: none; font: inherit; font-size: 11px; font-weight: 500; color: var(--fg2); padding: 8px 8px 7px; border-bottom: 2px solid transparent; cursor: pointer; white-space: nowrap; }
+  .tab[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--brand); }
+  .tab:hover { color: var(--fg); }
+  .tab:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; border-radius: 4px; }
+  .card { border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin: 0 0 10px; }
+  .card h4 { margin: 0 0 4px; font-size: 12px; font-weight: 600; }
+  .kv { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; padding: 2px 0; }
+  .kv span:first-child { color: var(--fg2); }
+  .meter { height: 4px; border-radius: 2px; background: var(--bg3); overflow: hidden; margin: 6px 0; }
+  .meter i { display: block; height: 100%; background: var(--brand); }
+  .pill { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; padding: 1px 6px; border-radius: 99px; background: var(--bg3); color: var(--fg2); }
+  .pill.ok { background: var(--green-tint); color: var(--green-fg); }
+  .pill.warn { background: var(--warn-tint); color: var(--warn-fg); }
+  .row-line { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 11px; }
+  .row-line:last-child { border-bottom: 0; }
+  .row-line .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .search { width: 100%; box-sizing: border-box; margin-bottom: 6px; }
+  .gh-box { border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+  .gh-box code { font-family: var(--mono); font-size: 10px; word-break: break-all; }
+  .empty-tab { color: var(--fg2); font-size: 11px; line-height: 1.5; padding: 4px 0 12px; }
+  .file-pick { display: flex; align-items: center; gap: 6px; padding: 4px 0; font-size: 11px; }
+  .file-pick input { margin: 0; }
+  .diff-line { font-family: var(--mono); font-size: 10px; padding: 1px 4px; white-space: pre-wrap; }
+  .diff-line.add { background: var(--green-tint); }
+  .diff-line.del { background: var(--danger-tint); }
+
   /* ---------- Figma UI3 tokens (fallbacks used outside Figma) ---------- */
   :root {
     --bg: var(--figma-color-bg, #ffffff);
@@ -511,6 +540,7 @@
 <body>
   <div id="demo" class="demo" style="display:none">Preview · sample data — run inside Figma for live inspection</div>
   <div id="hdr" class="hdr"></div>
+  <nav id="tabs" class="tabs" role="tablist" aria-label="Workspace"></nav>
   <div id="bar" class="bar"></div>
   <main id="main" aria-label="DevReady inspection"></main>
   <div id="menu" class="menu" role="menu" aria-label="DevReady menu"></div>
@@ -1083,7 +1113,10 @@ function render() {
 }
 function renderNow() {
   $('demo').style.display = S.demo ? 'block' : 'none';
+  renderTabs();
   const d = S.data;
+  // The workspace tabs own the panel; Design is the original inspector.
+  if (S.tab && S.tab !== 'design') return renderTabView(d);
   if (!d) { $('hdr').innerHTML = '<div class="hdr-row"><div class="name">DevReady</div></div>'; $('main').innerHTML = ''; return; }
   if (d.mode === 'empty') return renderEmpty(d);
   if (d.mode === 'locked') return renderLocked(d);
@@ -1530,6 +1563,23 @@ function setSetting(patch) {
   send({ type: 'settings', settings: patch }); render();
 }
 function menuFor(act, el) {
+  if (act === 'proj-menu') {
+    openMenu(el, [
+      { label: 'Rename project', run: () => wsRename() },
+      { label: 'Duplicate project', run: () => wsDuplicate() },
+      { label: (wsActive().archived ? 'Unarchive' : 'Archive') + ' project', run: () => wsArchive() },
+      { label: 'Delete project', run: () => wsDelete() },
+      { label: 'Add current selection', run: () => wsAddFile() }
+    ]);
+    return;
+  }
+  if (act === 'assets-menu') {
+    openMenu(el, [
+      { label: S.assetsView.all ? 'Show fewer assets' : 'Show all assets', run: () => { S.assetsView.all = !S.assetsView.all; render(); } },
+      { label: 'Export all as ZIP', run: () => { S.assetsView.kind = 'all'; S.assetsView.q = ''; const items = filteredAssets().map(a => ({ id: a.id, format: a.kind === 'icon' || a.kind === 'illustration' ? 'SVG' : 'PNG', scale: 2 })); if (items.length) { send({ type: 'export-all', items: items, zipName: 'assets.zip' }); toast('Exporting ' + items.length + ' assets…'); } } }
+    ]);
+    return;
+  }
   const s = S.data.settings;
   if (act === 'lang-menu') openMenu(el, Object.keys(LANGS).map(k => ({ label: LANGS[k], checked: S.lang === k, run: () => { S.lang = k; render(); } })));
   if (act === 'code-menu') {openMenu(el, [
@@ -1586,6 +1636,7 @@ document.addEventListener('click', e => {
   }
   const a = t.closest('[data-act]'); if (!a) return;
   const act = a.getAttribute('data-act');
+  if (appAction(act, a)) return;
   if (/-menu$/.test(act)) { if ($('menu').classList.contains('on') && S.menuAnchor === a) { closeMenu(); S.menuAnchor = null; return; } S.menuAnchor = a; menuFor(act, a); return; }
   const sp = S.data && S.data.spec;
   const live = ['baseline-save', 'baseline-clear', 'measure-native', 'measure-clear', 'ann-add', 'ann-del', 'res-add', 'res-del', 'map-save', 'map-del', 'notes-clear', 'goto-main'];
@@ -1689,12 +1740,907 @@ document.addEventListener('input', e => {
   if (e.target.id === 'pv-diff') { S.diff = e.target.checked; if (S.diff && S.opacity < 100) { S.opacity = 100; const r = $('pv-op'); if (r) r.value = 100; const v = $('pv-opv'); if (v) v.textContent = '100%'; } updateOverlay(); }
 });
 
+
+/* ===================================================================
+ * Workspace — tabs, projects, assets, history, GitHub
+ * The inspector stays exactly as it was: it is now the "Design" tab.
+ * =================================================================== */
+const TABS = [
+  { id: 'overview', label: 'Overview' },
+  { id: 'design', label: 'Design' },
+  { id: 'files', label: 'Design Files' },
+  { id: 'code', label: 'Code' },
+  { id: 'assets', label: 'Assets' },
+  { id: 'history', label: 'History' },
+  { id: 'github', label: 'GitHub' },
+  { id: 'settings', label: 'Settings' }
+];
+const ASSET_PAGE = 8;
+S.tab = S.tab || 'design';
+S.ws = S.ws || null;                 // { projects: [...], active: 'p…' }
+S.plan = S.plan || null;             // last pre-flight for the selection
+S.activity = S.activity || [];
+S.assetsView = S.assetsView || { all: false, q: '', kind: 'all' };
+S.hist = S.hist || { list: [], open: null, cmp: null };
+S.projView = S.projView || { q: '', sort: 'recent', archived: false };
+S.run = S.run || { queue: [], active: null, done: 0, total: 0, seq: 0, lang: 'html-css', cancelled: false, lastError: '' };
+S.lastCode = S.lastCode || null;      // { lang, nodeId, nodeName, at, files, truncated, assetErrors, revisionId }
+S.gh = S.gh || { status: undefined, repos: [], reposAll: false, q: '', repo: '', branches: [], branch: '', tree: null, files: {}, msg: 'Update from DevReady', busy: '', error: null, result: null };
+
+function newId(prefix) { return (prefix || 'p') + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+function activate(text) {
+  S.activity.unshift({ at: Date.now(), text: text });
+  if (S.activity.length > 20) S.activity.length = 20;
+}
+function agoShort(ts) { const d = Math.max(0, Date.now() - ts); if (d < 60000) return 'just now'; if (d < 3600000) return Math.round(d / 60000) + ' min ago'; if (d < 86400000) return Math.round(d / 3600000) + ' h ago'; return Math.round(d / 86400000) + ' d ago'; }
+function bytesLabel(n) { return n > 1024 * 1024 ? (n / 1048576).toFixed(1) + ' MB' : n > 1024 ? Math.round(n / 1024) + ' kB' : n + ' B'; }
+
+/* ---------- projects ---------- */
+function wsEnsure() {
+  if (S.ws && Array.isArray(S.ws.projects) && S.ws.projects.length) return S.ws;
+  const id = newId();
+  S.ws = { active: id, projects: [{ id: id, name: 'My project', created: Date.now(), updated: Date.now(), archived: false, files: [], revisions: [] }] };
+  return S.ws;
+}
+/** Projects as the Overview list shows them: filtered, archived hidden by default. */
+function projList() {
+  const w = wsEnsure();
+  const q = S.projView.q.toLowerCase();
+  return w.projects.filter(p => {
+    if (!!p.archived !== !!S.projView.archived) return false;
+    return !q || String(p.name || '').toLowerCase().indexOf(q) > -1;
+  }).sort((a, b) => {
+    if (S.projView.sort === 'name') return String(a.name).localeCompare(String(b.name));
+    if (S.projView.sort === 'created') return (b.created || 0) - (a.created || 0);
+    return (b.updated || b.created || 0) - (a.updated || a.created || 0);
+  });
+}
+function wsActive() {
+  const w = wsEnsure();
+  return w.projects.filter(p => p.id === w.active)[0] || w.projects[0];
+}
+function wsSave() {
+  const w = wsEnsure();
+  w.projects.forEach(p => {
+    p.files = (p.files || []).slice(-40);
+    p.revisions = (p.revisions || []).slice(-10).map(r => ({ id: r.id, at: r.at, label: r.label, lang: r.lang, nodeName: r.nodeName, files: (r.files || []).slice(0, 60).map(f => ({ name: f.name, size: f.size, hash: f.hash })), code: r.code && Object.keys(r.code).length <= 60 ? r.code : undefined }));
+  });
+  w.projects = w.projects.slice(-20);
+  send({ type: 'store-set', key: 'projects', value: JSON.stringify(w) });
+}
+function wsAddFile() {
+  const d = S.data;
+  const sp = d && (d.spec || d.node);
+  if (!sp || !sp.id) return toast('Select a layer in Figma first');
+  const p = wsActive();
+  if ((p.files || []).some(f => f.nodeId === sp.id)) return toast('That layer is already in this project');
+  p.files = (p.files || []).concat([{ id: newId('f'), nodeId: sp.id, name: sp.name || 'Layer', type: sp.type || '', page: d.page || '', added: Date.now() }]);
+  p.updated = Date.now();
+  activate('Added "' + (sp.name || 'Layer') + '" to ' + p.name);
+  wsSave(); render();
+  toast('Added to ' + p.name);
+}
+function wsRemoveFile(id) {
+  const p = wsActive();
+  p.files = (p.files || []).filter(f => f.id !== id);
+  p.updated = Date.now(); wsSave(); render();
+}
+/**
+ * Naming is done in the panel. Figma's plugin iframe blocks window.prompt(), so a
+ * prompt-based flow silently created "Untitled project" (or threw) — the form is the
+ * only flow that works in both Figma and a browser.
+ */
+/** Duplicate names are confusing in the switcher, so make them unique instead. */
+function uniqueName(w, base) {
+  const taken = n => w.projects.some(x => x.name === n && !x.archived);
+  if (!taken(base)) return base;
+  let n = 2;
+  while (taken(base + ' ' + n)) n++;
+  return base + ' ' + n;
+}
+function wsNewProject() { S.projForm = { kind: 'new', name: 'Untitled project' }; render(); }
+function wsRename() { S.projForm = { kind: 'rename', name: wsActive().name }; render(); }
+function wsCreateNamed(typed) {
+  const clean = String(typed || '').trim().slice(0, 60) || 'Untitled project';
+  const w = wsEnsure();
+  const name = uniqueName(w, clean);
+  const p = { id: newId(), name: name, created: Date.now(), updated: Date.now(), archived: false, files: [], revisions: [] };
+  w.projects.push(p); w.active = p.id;
+  S.projForm = null; S.projView.archived = false;
+  activate('Created project ' + name);
+  wsSave(); render();
+  toast('Created ' + name);
+}
+function wsSwitch(id) { const w = wsEnsure(); if (w.projects.some(p => p.id === id)) { w.active = id; S.hist.open = null; S.hist.cmp = null; wsSave(); render(); } }
+function wsRenameTo(name) {
+  const p = wsActive();
+  const clean = String(name || '').trim().slice(0, 60);
+  if (!clean) return toast('A project needs a name');
+  p.name = clean; p.updated = Date.now(); S.projForm = null;
+  activate('Renamed project to ' + clean);
+  wsSave(); render();
+}
+function wsDuplicate() {
+  const w = wsEnsure(), p = wsActive();
+  const copy = JSON.parse(JSON.stringify(p));
+  copy.id = newId(); copy.name = uniqueName(w, p.name + ' copy'); copy.created = Date.now(); copy.updated = Date.now();
+  w.projects.push(copy); w.active = copy.id; wsSave(); render();
+  toast('Duplicated project');
+}
+function wsDelete() {
+  const w = wsEnsure(), p = wsActive();
+  if (S.confirm !== 'delete-project') { S.confirm = 'delete-project'; render(); return; }
+  S.confirm = null;
+  w.projects = w.projects.filter(x => x.id !== p.id);
+  if (!w.projects.length) S.ws = null;
+  wsEnsure(); wsSave(); render();
+  toast('Project deleted');
+}
+function wsArchive() {
+  const p = wsActive();
+  p.archived = !p.archived; p.updated = Date.now();
+  activate((p.archived ? 'Archived ' : 'Unarchived ') + p.name);
+  // An archived project leaves the active list: follow the filter so the project
+  // the user just archived does not disappear without explanation.
+  S.projView.archived = p.archived;
+  wsSave(); render();
+}
+
+/* ---------- local revision history ---------- */
+function histEnsure() { S.hist = S.hist || { list: [] }; if (!Array.isArray(S.hist.list)) S.hist.list = []; return S.hist; }
+function hashText(t) { let h = 2166136261; for (let i = 0; i < t.length; i++) { h ^= t.charCodeAt(i); h = (h * 16777619) >>> 0; } return h.toString(36); }
+function histPush(lang, files) {
+  if (!files || !files.length) return;
+  const h = histEnsure();
+  const p = wsActive();
+  const code = {};
+  let total = 0;
+  const meta = files.map(f => {
+    const size = f.code.length;
+    total += size;
+    if (total <= 120000) code[f.name] = f.code;
+    return { name: f.name, size: size, hash: hashText(f.code) };
+  });
+  const rev = { id: newId('r'), at: Date.now(), project: p.id, lang: lang, nodeName: (S.data && S.data.spec && S.data.spec.name) || '', label: lang + ' · ' + files.length + ' file' + (files.length === 1 ? '' : 's'), files: meta, code: total <= 120000 ? code : undefined, full: total > 120000 };
+  h.list.unshift(rev);
+  h.list = h.list.slice(0, 8);
+  p.revisions = (p.revisions || []).concat([{ id: rev.id, at: rev.at, label: rev.label, lang: rev.lang, nodeName: rev.nodeName, files: meta, code: rev.code }]).slice(-10);
+  p.updated = Date.now();
+  send({ type: 'store-set', key: 'history', value: JSON.stringify({ list: h.list }) });
+  wsSave();
+}
+function histFile(r, name) { return r && r.code ? r.code[name] : null; }
+/** Line diff for the compare view: common prefix/suffix, then the changed block. */
+function lineDiff(before, after) {
+  const a = String(before || '').split('\n'), b = String(after || '').split('\n');
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start]) start++;
+  let endA = a.length - 1, endB = b.length - 1;
+  while (endA >= start && endB >= start && a[endA] === b[endB]) { endA--; endB--; }
+  return { removed: a.slice(start, endA + 1), added: b.slice(start, endB + 1), at: start };
+}
+function histCompare(baseId, headId) {
+  const h = histEnsure();
+  const a = h.list.filter(r => r.id === baseId)[0], b = h.list.filter(r => r.id === headId)[0];
+  if (!a || !b) return [];
+  const names = {};
+  (a.files || []).forEach(f => { names[f.name] = 1; });
+  (b.files || []).forEach(f => { names[f.name] = 1; });
+  return Object.keys(names).sort().map(name => {
+    const fa = (a.files || []).filter(f => f.name === name)[0], fb = (b.files || []).filter(f => f.name === name)[0];
+    if (!fa) return { name: name, kind: 'added' };
+    if (!fb) return { name: name, kind: 'removed' };
+    if (fa.hash === fb.hash) return { name: name, kind: 'unchanged' };
+    const d = lineDiff(histFile(a, name), histFile(b, name));
+    return { name: name, kind: 'changed', diff: d };
+  });
+}
+
+/* ---------- shared bits ---------- */
+function tabPill(text, kind) { return '<span class="pill' + (kind ? ' ' + kind : '') + '">' + esc(text) + '</span>'; }
+function card(title, body) { return '<div class="card"><h4>' + esc(title) + '</h4>' + body + '</div>'; }
+function tabHeader(title, sub2, actions) {
+  $('hdr').innerHTML = '<div class="hdr-row"><div class="name">' + esc(title) + '</div>' + (actions || '') + '</div>' +
+    (sub2 ? '<div class="h-type"><span class="faint">' + esc(sub2) + '</span></div>' : '');
+}
+function renderTabs() {
+  const el = $('tabs');
+  if (!el) return;
+  el.innerHTML = TABS.map(t => '<button class="tab" role="tab" id="tab-' + t.id + '" data-act="tab" data-tab="' + t.id + '" aria-selected="' + (S.tab === t.id) + '" aria-controls="main" tabindex="' + (S.tab === t.id ? '0' : '-1') + '">' + esc(t.label) + '</button>').join('');
+}
+function setTab(id) {
+  if (!TABS.some(t => t.id === id)) return;
+  S.tab = id;
+  if (id === 'github' && S.gh.status === undefined) send({ type: 'gh-status' });
+  if (id === 'overview' && !S.plan) send({ type: 'plan' });
+  render();
+}
+
+/* ---------- Overview ---------- */
+function viewOverview(d) {
+  const p = wsActive();
+  const cx = d && d.complexity;
+  const sp = d && (d.spec || d.node);
+  tabHeader('Overview', p.name + ' · ' + (p.archived ? 'archived' : 'active'), ib(I.more, 'proj-menu', 'Project actions'));
+  let html = '';
+  html += card('This project',
+    '<div class="kv"><span>Design entries</span><b>' + (p.files || []).length + '</b></div>' +
+    '<div class="kv"><span>Saved revisions</span><b>' + (p.revisions || []).length + '</b></div>' +
+    '<div class="kv"><span>Created</span><b>' + esc(fmtDate(new Date(p.created).toISOString())) + '</b></div>' +
+    '<div class="row-btns" style="margin-top:8px">' +
+    '<button class="btn" data-act="proj-add-file">Add selection</button>' +
+    '<button class="btn" data-act="tab" data-tab="design">Open Design</button>' +
+    '</div>');
+  if (sp) {
+    html += card('Current selection',
+      '<div class="row-line"><span class="nm"><b>' + esc(sp.name) + '</b><br><span class="faint">' + esc(sp.type || '') + '</span></span>' +
+      (S.plan && S.plan.nodes && S.plan.nodes[0] && S.plan.nodes[0].illustration ? tabPill('Illustration → SVG', 'ok') : '') + '</div>' +
+      (cx ? '<div class="kv"><span>Layers</span><b>' + cx.nodes.toLocaleString() + (cx.clipped ? '+' : '') + '</b></div>' +
+        '<div class="kv"><span>Depth</span><b>' + cx.depth + '</b></div>' +
+        '<div class="kv"><span>Cost</span><b>' + cx.level + ' · ~' + cx.estimatedMs + ' ms</b></div>' +
+        (cx.warnings && cx.warnings.length ? '<div class="warn" style="margin-top:6px">' + esc(cx.warnings[0]) + '</div>' : '') : '') +
+      (d && d.assets && d.assets.length ? '<div class="kv"><span>Assets found</span><b>' + d.assets.length + '</b></div>' : ''));
+  } else {
+    html += card('Current selection', '<div class="empty-tab">Select a frame in Figma to see what DevReady will do with it.</div>');
+  }
+  html += card('Recent activity',
+    S.activity.length
+      ? S.activity.slice(0, 6).map(a => '<div class="row-line"><span class="nm">' + esc(a.text) + '</span><span class="faint">' + esc(agoShort(a.at)) + '</span></div>').join('')
+      : '<div class="empty-tab">Nothing yet. Generate code, add a design entry or push to GitHub — it shows up here.</div>');
+  const list = projList();
+  html += card('Projects',
+    '<input class="in search" id="proj-q" placeholder="Search projects" value="' + esc(S.projView.q) + '" aria-label="Search projects">' +
+    '<div class="seg" role="group" aria-label="Sort projects">' +
+    [['recent', 'Recent'], ['name', 'Name'], ['created', 'Created']].map(x =>
+      '<button class="' + (S.projView.sort === x[0] ? 'on' : '') + '" data-act="proj-sort" data-sort="' + x[0] + '">' + x[1] + '</button>').join('') +
+    '<button class="' + (S.projView.archived ? 'on' : '') + '" data-act="proj-archived">Archived</button>' +
+    '</div>' +
+    (list.length
+      ? list.map(x => '<div class="row-line"><span class="nm">' + esc(x.name) + (x.archived ? ' <span class="faint">(archived)</span>' : '') +
+        '<br><span class="faint">' + (x.files || []).length + ' files · ' + esc(agoShort(x.updated || x.created)) + '</span></span>' +
+        (x.id === p.id ? tabPill('active', 'ok') : '<button class="mini" data-act="proj-switch" data-id="' + esc(x.id) + '">Open</button>') + '</div>').join('')
+      : '<div class="empty-tab">' + (S.projView.q ? 'No project matches "' + esc(S.projView.q) + '".' : 'No archived projects.') + '</div>') +
+    (S.projForm
+      ? '<div class="form" style="margin-top:8px">' +
+        '<input class="in" id="proj-name" aria-label="Project name" value="' + esc(S.projForm.name) + '" placeholder="Project name">' +
+        '<div class="row"><button class="btn" data-act="proj-form-cancel">Cancel</button>' +
+        '<button class="btn blue" data-act="' + (S.projForm.kind === 'rename' ? 'proj-save' : 'proj-create') + '">' + (S.projForm.kind === 'rename' ? 'Save' : 'Create') + '</button></div></div>'
+      : '<div class="row-btns" style="margin-top:8px"><button class="btn" data-act="proj-new">New project</button></div>'));
+  $('main').innerHTML = html;
+}
+
+/* ---------- Assets ---------- */
+function assetKindLabel(a) {
+  if (a.kind === 'illustration') return 'SVG illustration';
+  if (a.kind === 'icon') return 'SVG icon';
+  if (a.kind === 'image') return 'Raster image';
+  if (a.kind === 'export') return 'Export ' + ((a.formats || []).join(', ') || '');
+  return a.kind || 'asset';
+}
+function filteredAssets() {
+  const d = S.data;
+  const list = (d && d.assets) || [];
+  const q = S.assetsView.q.toLowerCase();
+  return list.filter(a => {
+    if (a.kind === 'selection') return false;
+    if (S.assetsView.kind !== 'all' && a.kind !== S.assetsView.kind) return false;
+    if (q && String(a.name || '').toLowerCase().indexOf(q) === -1) return false;
+    return true;
+  });
+}
+function viewAssets(d) {
+  const all = filteredAssets();
+  const kinds = {};
+  ((d && d.assets) || []).forEach(a => { if (a.kind !== 'selection') kinds[a.kind] = 1; });
+  tabHeader('Assets', all.length + ' of ' + (((d && d.assets) || []).length) + ' on this layer', ib(I.more, 'assets-menu', 'Asset options'));
+  const shown = S.assetsView.all ? all : all.slice(0, ASSET_PAGE);
+  let html = '<div style="padding:0 0 4px">' +
+    '<input class="in search" id="assets-q" placeholder="Search assets by name" value="' + esc(S.assetsView.q) + '" aria-label="Search assets">' +
+    '<div class="seg" role="group" aria-label="Filter by type">' +
+    ['all'].concat(Object.keys(kinds)).map(k => '<button class="' + (S.assetsView.kind === k ? 'on' : '') + '" data-act="assets-kind" data-kind="' + esc(k) + '">' + esc(k === 'all' ? 'All' : (k === 'illustration' ? 'Illustrations' : k === 'icon' ? 'Icons' : k === 'image' ? 'Images' : 'Exports')) + '</button>').join('') +
+    '</div></div>';
+  if (!all.length) {
+    html += '<div class="empty-tab">' + (d && d.assets && d.assets.length ? 'No asset matches this filter.' : 'No assets on this layer. Select a frame with icons, images, illustrations or export settings.') + '</div>';
+  } else {
+    html += '<div>' + shown.map(a =>
+      '<div class="row-line">' +
+      '<span class="th" data-thumb="' + esc(a.id) + '" aria-hidden="true" style="width:28px;height:28px;overflow:hidden;border-radius:4px;background:var(--bg2);display:inline-flex;align-items:center;justify-content:center">' +
+      (S.thumbs[a.id] ? '<img src="' + esc(S.thumbs[a.id]) + '" alt="" style="width:100%;height:100%;object-fit:contain">' : '') + '</span>' +
+      '<span class="nm">' + esc(a.name) + '<br><span class="faint">' + esc(assetKindLabel(a)) + (a.w ? ' · ' + a.w + '×' + a.h : '') + '</span></span>' +
+      '<button class="btn sm" data-export="' + esc(a.id) + '" title="Export this asset">' + I.dl + '</button>' +
+      '</div>').join('') + '</div>';
+    if (all.length > ASSET_PAGE) {
+      html += '<button class="more-row" data-act="assets-all">' + (S.assetsView.all ? 'Show less' : 'Show all ' + all.length + ' assets') + '</button>';
+    }
+    html += '<div class="row-btns" style="margin-top:8px"><button class="btn wide" data-act="assets-export-all">Export all as ZIP</button></div>';
+  }
+  if (d && d.assets && d.assets.some(a => a.kind === 'illustration')) {
+    html += '<div class="faint" style="margin-top:10px">' + I.info + ' Illustration frames are exported as one SVG each. Their inner vectors stay in the SVG — they are not turned into separate elements, so the artwork matches the design exactly.</div>';
+  }
+  $('main').innerHTML = html;
+  (S.data && S.data.assets || []).slice(0, 24).forEach(a => { if (a.kind !== 'selection' && !S.thumbs[a.id]) send({ type: 'thumb-request', id: a.id }); });
+}
+
+/* ---------- Design Files ---------- */
+/**
+ * The processing queue. One file at a time, so a heavy frame cannot starve the
+ * panel, and each entry keeps its own status: a failure stays visible and can be
+ * retried without re-running the files that already succeeded.
+ */
+function wsFileEntry(p, id) { return ((p && p.files) || []).filter(f => f.id === id)[0] || null; }
+function filesPending(onlyFailed) {
+  const p = wsActive();
+  return (p.files || []).filter(f => (onlyFailed ? f.status === 'error' : f.status !== 'ok') && f.status !== 'running');
+}
+function filesRun(onlyFailed) {
+  const p = wsActive();
+  const list = filesPending(onlyFailed);
+  if (!list.length) { toast(onlyFailed ? 'Nothing failed — everything is generated' : 'Everything in this project is already generated'); return; }
+  if (S.run.active) { toast('A run is already in progress'); return; }
+  S.run.queue = list.map(f => f.id);
+  S.run.done = 0;
+  S.run.total = S.run.queue.length;
+  S.run.cancelled = false;
+  S.run.lastError = '';
+  activate('Queued ' + S.run.total + ' file' + (S.run.total === 1 ? '' : 's') + ' in ' + p.name);
+  filesNext();
+}
+function filesRunOne(id) {
+  const f = wsFileEntry(wsActive(), id);
+  if (!f) return;
+  if (f.status === 'running') { toast('That file is running'); return; }
+  if (S.run.active) { toast('A run is already in progress'); return; }
+  S.run.queue = [id]; S.run.done = 0; S.run.total = 1; S.run.cancelled = false;
+  filesNext();
+}
+function filesNext() {
+  const p = wsActive();
+  if (S.run.cancelled || !S.run.queue.length) {
+    const failed = (p.files || []).filter(f => f.status === 'error').length;
+    S.run.active = null;
+    if (S.run.cancelled) activate('Cancelled the run after ' + S.run.done + ' of ' + S.run.total);
+    else activate('Generated ' + S.run.done + ' of ' + S.run.total + ' file' + (S.run.total === 1 ? '' : 's') + (failed ? ' · ' + failed + ' failed' : ''));
+    wsSave(); render();
+    return;
+  }
+  const id = S.run.queue.shift();
+  const f = wsFileEntry(p, id);
+  if (!f) return filesNext();
+  const jobId = ++S.run.seq + 100000;
+  S.run.active = { fileId: id, jobId: jobId, requestId: 'r' + jobId, nodeId: f.nodeId };
+  f.status = 'running'; f.error = '';
+  render();
+  send({ type: 'gen-code', lang: S.run.lang, nodeId: f.nodeId, requestId: S.run.active.requestId, jobId: jobId });
+}
+function filesCancel() {
+  if (!S.run.active) { toast('No run in progress'); return; }
+  S.run.cancelled = true;
+  send({ type: 'cancel', jobId: S.run.active.jobId });
+}
+/** Resolve a queue reply. Returns true when the message belonged to the queue. */
+function filesSettle(m) {
+  const a = S.run.active;
+  if (!a || !m.jobId || m.jobId !== a.jobId) return false;
+  const p = wsActive();
+  const f = wsFileEntry(p, a.fileId);
+  const out = m.out || {};
+  if (f) {
+    if (m.cancelled) { f.status = 'idle'; }
+    else if (out.error) { f.status = 'error'; f.error = String(out.error).slice(0, 200); }
+    else if (out.files && out.files.length) {
+      f.status = 'ok'; f.at = Date.now(); f.count = out.files.length; f.lang = m.lang;
+      f.rev = null;
+    } else { f.status = 'error'; f.error = 'No files were produced'; }
+    f.files = f.status === 'ok' ? out.files.map(x => ({ name: x.name, size: (x.code || '').length })) : [];
+    if (f.status === 'ok') {
+      S.run.done++;
+      lastCodeFrom(m.lang, m.nodeId, f, out);
+      try { histPush(m.lang, out.files); } catch (e) { diagUi('history'); }
+      activate('Generated ' + f.name + ' (' + out.files.length + ' files)');
+    } else if (f.status === 'error') {
+      S.run.lastError = f.error;
+      activate('Failed on ' + f.name);
+    }
+  }
+  S.run.active = null;
+  wsSave();
+  filesNext();
+  return true;
+}
+function viewFiles(d) {
+  const p = wsActive();
+  const files = p.files || [];
+  const ok = files.filter(f => f.status === 'ok').length;
+  const bad = files.filter(f => f.status === 'error').length;
+  tabHeader('Design Files', files.length + ' in ' + p.name + ' · ' + ok + ' generated' + (bad ? ' · ' + bad + ' failed' : ''), ib(I.more, 'proj-menu', 'Project actions'));
+  let html = '';
+  if (!files.length) {
+    html += '<div class="empty-tab">This project has no design files yet.<br>Select a frame or component in Figma, then press <b>Add selection</b>. Each entry keeps its own output and status.</div>' +
+      '<div class="row-btns" style="margin-top:8px"><button class="btn wide" data-act="files-add">Add current selection</button></div>';
+    $('main').innerHTML = html;
+    return;
+  }
+  const running = !!S.run.active;
+  if (running || (S.run.total && S.run.done < S.run.total && !S.run.cancelled && !S.run.active && S.run.queue.length)) {
+    html += '<div class="card"><h4>Generating ' + (S.run.done + (running ? 1 : 0)) + ' of ' + S.run.total + '</h4>' +
+      '<div class="meter"><i style="width:' + Math.round(S.run.done / Math.max(1, S.run.total) * 100) + '%"></i></div>' +
+      '<div class="row-btns" style="margin-top:8px"><button class="btn sm" data-act="files-cancel">Cancel</button></div></div>';
+  }
+  html += '<div class="faint" style="padding:0 0 6px">Language <b>' + esc(LANGS[S.run.lang] || S.run.lang) + '</b></div>';
+  html += files.map(f => {
+    const kind = f.status === 'ok' ? 'ok' : f.status === 'error' ? 'warn' : '';
+    const label = f.status === 'ok' ? 'Generated' : f.status === 'error' ? 'Failed' : f.status === 'running' ? 'Generating…' : 'Not generated';
+    return '<div class="row-line">' +
+      '<span class="th" data-thumb="' + esc(f.nodeId) + '" aria-hidden="true" style="width:26px;height:26px;overflow:hidden;border-radius:4px;background:var(--bg2);display:inline-flex;align-items:center;justify-content:center">' +
+      (S.thumbs[f.nodeId] ? '<img src="' + esc(S.thumbs[f.nodeId]) + '" alt="" style="width:100%;height:100%;object-fit:contain">' : '') + '</span>' +
+      '<span class="nm">' + esc(f.name) + '<br><span class="faint">' + esc(f.type || 'layer') + (f.page ? ' · ' + esc(f.page) : '') +
+      (f.status === 'ok' ? ' · ' + (f.count || 0) + ' files · ' + esc(agoShort(f.at || f.added)) : '') + '</span>' +
+      (f.status === 'error' && f.error ? '<br><span class="faint">' + esc(f.error) + '</span>' : '') + '</span>' +
+      tabPill(label, kind) +
+      (f.status === 'running' ? '' : '<button class="mini" data-act="files-run" data-id="' + esc(f.id) + '">' + (f.status === 'error' ? 'Retry' : 'Generate') + '</button>') +
+      '<button class="mini" data-act="files-rm" data-id="' + esc(f.id) + '" title="Remove from project" aria-label="Remove ' + esc(f.name) + '">' + I.x + '</button>' +
+      '</div>';
+  }).join('');
+  if (S.run.lastError) html += '<div class="warn" style="margin-top:8px">Last failure: ' + esc(S.run.lastError) + '</div>';
+  html += '<div class="row-btns" style="margin-top:8px">' +
+    '<button class="btn sm" data-act="files-run-all"' + (running ? ' disabled' : '') + '>Generate all</button>' +
+    (bad ? '<button class="btn sm" data-act="files-retry"' + (running ? ' disabled' : '') + '>Retry ' + bad + ' failed</button>' : '') +
+    '<button class="btn sm" data-act="files-add"' + (running ? ' disabled' : '') + '>Add selection</button>' +
+    '</div>';
+  html += '<div class="faint" style="margin-top:10px">Files are processed one at a time. A failure stops that file only — the rest of the queue keeps going, and nothing already generated is lost. Progress is saved, so you can close the plugin and come back.</div>';
+  $('main').innerHTML = html;
+  files.slice(0, 12).forEach(f => { if (!S.thumbs[f.nodeId]) send({ type: 'thumb-request', id: f.nodeId }); });
+}
+
+/* ---------- Generated code ---------- */
+function lastCodeFrom(lang, nodeId, fileRec, out) {
+  S.lastCode = {
+    lang: lang,
+    nodeId: nodeId,
+    nodeName: (fileRec && fileRec.name) || (S.data && S.data.spec && S.data.spec.name) || 'selection',
+    at: Date.now(),
+    files: (out.files || []).map(f => ({ name: f.name, size: (f.code || '').length, code: (f.code || '').length <= 60000 ? f.code : null })),
+    truncated: !!out.truncated,
+    assetErrors: out.assetErrors || [],
+    error: out.error || '',
+    revisionId: (S.hist && S.hist.list && S.hist.list[0] && S.hist.list[0].id) || null
+  };
+}
+function viewCode() {
+  const lc = S.lastCode;
+  const p = wsActive();
+  tabHeader('Code', lc ? lc.nodeName + ' · ' + (LANGS[lc.lang] || lc.lang) : 'Nothing generated yet', ib(I.more, 'proj-menu', 'Project actions'));
+  if (!lc || !lc.files || !lc.files.length) {
+    $('main').innerHTML = '<div class="empty-tab">No code yet for ' + esc(p.name) + '.<br>Generate from the Design tab, or run a whole project from Design Files.</div>' +
+      '<div class="row-btns" style="margin-top:8px"><button class="btn" data-act="code-open-files">Open Design Files</button></div>';
+    return;
+  }
+  const total = lc.files.reduce((n, f) => n + f.size, 0);
+  let html = '<div class="card"><h4>' + esc(LANGS[lc.lang] || lc.lang) + ' · ' + lc.files.length + ' file' + (lc.files.length === 1 ? '' : 's') + ' · ' + bytesLabel(total) + '</h4>' +
+    '<div class="kv"><span>Design layer</span><b>' + esc(lc.nodeName) + '</b></div>' +
+    '<div class="kv"><span>Generated</span><b>' + esc(agoShort(lc.at)) + '</b></div>' +
+    '<div class="kv"><span>Revision</span><b>' + (lc.revisionId ? esc(lc.revisionId) : 'not stored') + '</b></div>' +
+    (lc.truncated ? '<div class="warn" style="margin-top:6px">This layer hit the generation limit — deeper layers are missing. Select a smaller frame for complete output.</div>' : '') +
+    (lc.assetErrors.length ? '<div class="warn" style="margin-top:6px">' + esc(lc.assetErrors.length + ' asset export issue' + (lc.assetErrors.length === 1 ? '' : 's')) + ': ' + esc(lc.assetErrors[0]) + '</div>' : '') +
+    '</div>';
+  html += lc.files.map(f =>
+    '<div class="row-line"><span class="nm">' + esc(f.name) + '<br><span class="faint">' + bytesLabel(f.size) + (f.code === null ? ' · too large to preview' : '') + '</span></span>' +
+    '<button class="btn sm" data-act="code-dl" data-name="' + esc(f.name) + '" title="Download ' + esc(f.name) + '">' + I.dl + '</button></div>').join('');
+  html += '<div class="row-btns" style="margin-top:8px">' +
+    '<button class="btn wide" data-act="code-dl-all">Download all (ZIP)</button>' +
+    '</div><div class="row-btns" style="margin-top:6px">' +
+    '<button class="btn sm" data-act="code-push">Push to GitHub</button>' +
+    '<button class="btn sm" data-act="tab" data-tab="history">History</button></div>';
+  html += '<div class="faint" style="margin-top:10px">These files belong to ' + esc(p.name) + '. Switching projects never mixes their output.</div>';
+  $('main').innerHTML = html;
+}
+function codeDownload(name) {
+  const lc = S.lastCode;
+  const f = lc && (lc.files || []).filter(x => x.name === name)[0];
+  if (!f) return;
+  if (f.code === null || f.code === undefined) { toast('That file is too large to keep in the panel — download all instead'); return; }
+  download(f.name, new TextEncoder().encode(f.code), 'text/plain');
+}
+function codeDownloadAll() {
+  const lc = S.lastCode;
+  if (!lc || !lc.files || !lc.files.length) { toast('Generate code first'); return; }
+  const enc = new TextEncoder();
+  const files = lc.files.filter(f => f.code !== null && f.code !== undefined).map(f => ({ name: f.name, bytes: enc.encode(f.code) }));
+  if (!files.length) { toast('These files are too large to zip here'); return; }
+  download('devready-' + (wsActive().name || 'project').replace(/[^A-Za-z0-9._-]+/g, '-').toLowerCase() + '.zip', makeZip(files), MIME.zip);
+  activate('Downloaded ' + files.length + ' file' + (files.length === 1 ? '' : 's'));
+  render();
+}
+/** Panel-side diagnostics are rare; keep the last one for the Settings tab. */
+function diagUi(where) {
+  S.uiWarn = { where: where, at: Date.now() };
+}
+
+/* ---------- History ---------- */
+function viewHistory() {
+  const h = histEnsure();
+  const p = wsActive();
+  tabHeader('History', 'Local revisions of generated code · ' + p.name, '');
+  let html = '<div class="faint" style="margin-bottom:8px">Revisions are saved on this machine when code is generated. They never leave Figma unless you publish them.</div>';
+  if (!h.list.length) {
+    html += '<div class="empty-tab">No revisions yet. Generate code for a layer — every successful run is kept here (up to 8 revisions).</div>';
+        html += '<div class="row-btns"><button class="btn" data-act="tab" data-tab="design">Open Design</button></div>';
+  } else {
+    html += h.list.map((r, i) =>
+      '<div class="row-line"><span class="nm"><b>' + esc(r.label || 'revision') + '</b><br><span class="faint">' + esc(fmtDate(new Date(r.at).toISOString())) + (r.nodeName ? ' · ' + esc(r.nodeName) : '') + ' · ' + (r.files || []).length + ' files' + (r.full ? ' · code not stored' : '') + '</span></span>' +
+      '<button class="mini" data-act="hist-cmp" data-id="' + esc(r.id) + '">Compare</button>' +
+      (r.code ? '<button class="mini" data-act="hist-restore" data-id="' + esc(r.id) + '">Restore</button>' : '') +
+      '</div>' +
+      (S.hist.cmp === r.id ? (i + 1 < h.list.length ? histDiffHtml(h.list[i + 1], r) : '<div class="faint" style="padding:4px 0">This is the first revision — nothing to compare against.</div>') : '')).join('');
+  }
+  if (S.confirm === 'restore') html += '<div class="warn" style="margin-top:8px">Restore downloads that revision as a ZIP and records it as the current code. Confirm to continue.</div>';
+  $('main').innerHTML = html;
+}
+function histDiffHtml(base, head) {
+  const rows = histCompare(base.id, head.id);
+  if (!rows.length) return '<div class="faint" style="padding:4px 0">No files in either revision.</div>';
+  return '<div style="padding:4px 0 8px">' + rows.map(r =>
+    '<div class="row-line"><span class="nm">' + esc(r.name) + '</span>' + tabPill(r.kind, r.kind === 'unchanged' ? '' : r.kind === 'added' ? 'ok' : r.kind === 'removed' ? 'warn' : '') + '</div>' +
+    (r.diff ? r.diff.removed.slice(0, 4).map(l => '<div class="diff-line del">− ' + esc(l) + '</div>').join('') + r.diff.added.slice(0, 4).map(l => '<div class="diff-line add">+ ' + esc(l) + '</div>').join('') : '')).join('') + '</div>';
+}
+function histRestore(id) {
+  const h = histEnsure();
+  const r = h.list.filter(x => x.id === id)[0];
+  if (!r) return;
+  if (!r.code) return toast('This revision is too large to keep locally — regenerate it instead');
+  if (S.confirm !== 'restore:' + id) { S.confirm = 'restore:' + id; render(); toast('Press Restore again to confirm'); return; }
+  S.confirm = null;
+  const enc = new TextEncoder();
+  const files = Object.keys(r.code).map(n => ({ name: n, bytes: enc.encode(r.code[n]) }));
+  download('devready-' + r.id + '.zip', makeZip(files), MIME.zip);
+  activate('Restored ' + (r.label || 'a revision'));
+  toast('Restored revision downloaded');
+  render();
+}
+
+/* ---------- GitHub ---------- */
+function ghConnected() { return !!(S.gh.status && S.gh.status.connected); }
+function ghErrorBox(err) {
+  if (!err) return '';
+  const tips = {
+    auth: 'Create a new token, then Disconnect and connect again.',
+    permission: 'The token needs Contents: read and write, and Administration: write to create repositories.',
+    'rate-limit': 'Wait for the reset time shown, then try again.',
+    conflict: 'Preview the repository again to see the current files before pushing.',
+    network: 'Check your connection. Nothing was changed on GitHub.',
+    'no-changes': 'The selected files already match the repository. Nothing was sent.',
+  };
+  return '<div class="warn" style="margin:6px 0">' + I.info + '<b>' + esc(err.code || 'error') + '</b> — ' + esc(err.message || '') +
+    (tips[err.code] ? '<br><span class="faint">' + esc(tips[err.code]) + '</span>' : '') + '</div>';
+}
+function ghLocalFiles() {
+  const lc = S.lastCode;
+  if (lc && lc.files && lc.files.length) {
+    const files = lc.files.filter(f => f.code !== null && f.code !== undefined).map(f => ({ path: f.name, content: f.code }));
+    if (files.length) return files;
+  }
+  const h = histEnsure();
+  const p = wsActive();
+  const rev = (p.revisions || []).slice(-1)[0] || h.list[0];
+  if (rev && rev.code) return Object.keys(rev.code).map(n => ({ path: n, content: rev.code[n] }));
+  const c = S.code && S.code[S.lang];
+  if (c && c.files) return c.files.map(f => ({ path: f.name, content: f.code }));
+  return [];
+}
+/** Status labels for the preview, using the hashes the plugin computed. */
+const GH_STATUS_LABEL = { added: 'will add', modified: 'modified', unchanged: 'unchanged', deleted: 'delete', unknown: 'in repo' };
+function ghPreviewRows() {
+  const g = S.gh;
+  const files = ghLocalFiles();
+  const tree = g.tree && g.tree.repo === g.repo && g.tree.branch === g.branch ? g.tree : null;
+  if (!tree) return { rows: files.map(f => ({ path: f.path, content: f.content, status: 'unknown' })), compared: false };
+  const status = {};
+  (tree.local || []).forEach(x => { status[x.path] = x.status; });
+  const rows = files.map(f => ({ path: f.path, content: f.content, status: status[f.path] || 'unknown' }));
+  (tree.deleted || []).forEach(x => rows.push({ path: x.path, content: '', status: 'deleted', del: true }));
+  return { rows: rows, compared: true, empty: !!tree.empty };
+}
+function viewGithub() {
+  const g = S.gh;
+  tabHeader('GitHub', 'Optional — publish generated code to a repository', ghConnected() ? '' : '');
+  if (g.status === undefined) {
+    $('main').innerHTML = '<div class="empty-tab">Checking GitHub connection…</div>';
+    if (!g.pending) { g.pending = true; send({ type: 'gh-status' }); }
+    return;
+  }
+  let html = '';
+  if (!ghConnected()) {
+    html += g.status && g.status.error ? ghErrorBox(g.status.error) : '';
+    html += '<div class="gh-box"><h4>Connect GitHub</h4>' +
+      '<div class="faint" style="margin:4px 0 8px">DevReady has no server, so it cannot run an OAuth flow with a client secret. Use a fine-grained personal access token instead: it stays on this machine, is used only for the actions you press, and is never written into the file or generated code.</div>' +
+      '<input class="in" id="gh-token" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_… or ghp_…" aria-label="GitHub personal access token">' +
+      '<div class="row-btns" style="margin-top:6px"><button class="btn blue" data-act="gh-connect">' + (g.busy === 'connect' ? 'Checking…' : 'Connect') + '</button>' +
+      '<a class="btn" href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">Create a token</a></div>' +
+      '<div class="faint" style="margin-top:6px">Required permissions: <b>Contents: read and write</b>. Add <b>Administration: write</b> only if you want DevReady to create repositories for you.</div></div>';
+    $('main').innerHTML = html;
+    return;
+  }
+  const st = g.status;
+  html += '<div class="gh-box"><div class="row-line"><span class="nm">' + I.github + ' <b>' + esc(st.login) + '</b>' + (st.scopes ? '<br><span class="faint">scopes: ' + esc(st.scopes) + '</span>' : '') + '</span>' +
+    '<button class="mini" data-act="gh-disconnect">Disconnect</button></div>' + ghErrorBox(g.error) + '</div>';
+
+  // repository picker
+  if (g.busy === 'repos') html += '<div class="empty-tab">Loading repositories…</div>';
+  else if (!g.repos.length) html += '<div class="row-btns" style="margin-bottom:8px"><button class="btn" data-act="gh-repos">Load repositories</button></div>';
+  if (g.repos.length) {
+    const list = g.repos.filter(r => !g.q || r.fullName.toLowerCase().indexOf(g.q.toLowerCase()) > -1);
+    const shown = g.reposAll ? list : list.slice(0, 6);
+    html += '<div class="gh-box"><h4>Repository</h4>' +
+      '<input class="in search" id="gh-repo-q" placeholder="Filter repositories" value="' + esc(g.q) + '" aria-label="Filter repositories">' +
+      (shown.length ? shown.map(r => '<div class="row-line"><span class="nm">' + esc(r.fullName) + (r.private ? ' <span class="faint">private</span>' : '') + (r.empty ? ' <span class="faint">empty</span>' : '') + '</span>' +
+        (g.repo === r.fullName ? tabPill('selected', 'ok') : '<button class="mini" data-act="gh-pick" data-repo="' + esc(r.fullName) + '">Use</button>') + '</div>').join('')
+        : '<div class="empty-tab">No repository matches that filter.</div>') +
+      (list.length > 6 ? '<button class="more-row" data-act="gh-repos-all">' + (g.reposAll ? 'Show less' : 'Show all ' + list.length) + '</button>' : '') +
+      '<div class="row-btns" style="margin-top:8px"><button class="btn" data-act="gh-repos">Refresh</button><button class="btn" data-act="form-gh-new">New repository</button></div>' +
+      (S.form === 'gh-new' ? '<div class="form" style="margin-top:8px"><input class="in" id="gh-new-name" placeholder="repo-name" aria-label="Repository name"><input class="in" id="gh-new-desc" placeholder="Description (optional)" aria-label="Description">' +
+        '<label class="faint" style="display:block;margin:4px 0"><input type="checkbox" id="gh-new-private" checked> Private repository</label>' +
+        '<div class="row"><button class="btn" data-act="form-cancel">Cancel</button><button class="btn blue" data-act="gh-create">Create</button></div></div>' : '') +
+      '</div>';
+  }
+
+  if (g.repo) {
+    html += '<div class="gh-box"><h4>Branch</h4>' +
+      (g.branches.length ? g.branches.map(b => '<div class="row-line"><span class="nm">' + esc(b.name) + (b.protected ? ' <span class="faint">protected</span>' : '') + '</span>' +
+        (g.branch === b.name ? tabPill('target', 'ok') : '<button class="mini" data-act="gh-branch" data-branch="' + esc(b.name) + '">Use</button>') + '</div>').join('')
+        : '<div class="empty-tab">' + (g.busy === 'branches' ? 'Loading branches…' : 'No branches loaded.') + '</div>') +
+      '<div class="row-btns" style="margin-top:8px"><button class="btn" data-act="gh-branches">' + (g.busy === 'branches' ? 'Loading…' : 'Refresh branches') + '</button>' +
+      (g.repo && !g.branches.some(b => b.name === g.branch) && g.branch ? '<button class="btn blue" data-act="gh-preview">Preview new branch</button>' : '<button class="btn blue" data-act="gh-preview">Preview changes</button>') +
+      '</div>' +
+      '<input class="in" id="gh-branch-new" placeholder="New branch name (optional)" aria-label="New branch name" style="margin-top:6px">' +
+      '</div>';
+
+    const pv = ghPreviewRows();
+    const files = pv.rows;
+    if (files.length) {
+      const selected = files.filter(f => g.files[f.path] !== false);
+      const counts = {};
+      files.forEach(f => { counts[f.status] = (counts[f.status] || 0) + 1; });
+      html += '<div class="gh-box"><h4>Changes to publish</h4>' +
+        (pv.compared
+          ? '<div class="faint" style="margin-bottom:4px">Compared with ' + esc(g.repo) + '@' + esc(g.branch) + (g.tree.truncated ? ' (file list truncated)' : '') +
+            ' · ' + Object.keys(GH_STATUS_LABEL).filter(k => counts[k]).map(k => counts[k] + ' ' + GH_STATUS_LABEL[k]).join(' · ') + '</div>'
+          : '<div class="faint" style="margin-bottom:4px">Preview to compare with the repository.</div>') +
+        (pv.empty ? '<div class="faint" style="margin-bottom:4px">This repository has no commits yet — the first push creates them.</div>' : '') +
+        files.map(f => {
+          const st2 = f.status;
+          const on = g.files[f.path] !== false;
+          return '<label class="file-pick"><input type="checkbox" data-act="gh-toggle-file" data-path="' + esc(f.path) + '" data-del="' + (f.del ? '1' : '') + '"' + (on ? ' checked' : '') + '>' +
+            '<span class="nm">' + esc(f.path) + '</span>' + tabPill(GH_STATUS_LABEL[st2] || st2, st2 === 'added' ? 'ok' : st2 === 'unchanged' ? '' : 'warn') +
+            '<span class="faint">' + (f.del ? 'removes the file' : bytesLabel(f.content.length)) + '</span></label>';
+        }).join('') +
+        '<div class="faint" style="margin:6px 0">' + selected.length + ' of ' + files.length + ' selected' +
+        (selected.some(f => f.status === 'unchanged') ? ' · unchanged files are sent as-is and change nothing' : '') + '</div>' +
+        '<input class="in" id="gh-msg" placeholder="Commit message" value="' + esc(g.msg) + '" aria-label="Commit message">' +
+        '<div class="row-btns" style="margin-top:6px"><button class="btn blue wide" data-act="gh-push"' + (g.busy === 'push' ? ' disabled' : '') + '>' + (g.busy === 'push' ? 'Pushing…' : 'Commit & push to ' + esc(g.branch || 'branch')) + '</button></div>' +
+        (g.result ? '<div class="faint" style="margin-top:6px">' + I.check + ' Pushed ' + g.result.files + ' file' + (g.result.files === 1 ? '' : 's') + ' to ' + esc(g.result.branch) + ' · <a href="' + esc(g.result.url) + '" target="_blank" rel="noopener noreferrer">view commit</a></div>' : '') +
+        '</div>';
+    } else {
+      html += '<div class="empty-tab">Nothing to publish yet. Generate code in the Design tab first — revisions are what GitHub receives.</div>';
+    }
+  }
+  $('main').innerHTML = html;
+}
+
+/* ---------- Settings ---------- */
+function settingRow(label, hint, control) {
+  return '<div class="kv" style="align-items:center;padding:6px 0"><span style="flex:1">' + esc(label) + (hint ? '<br><span class="faint">' + esc(hint) + '</span>' : '') + '</span>' + control + '</div>';
+}
+function selectBox(id, value, options) {
+  return '<select class="in" id="' + id + '" style="width:auto">' + options.map(o => '<option value="' + esc(o[0]) + '"' + (o[0] === value ? ' selected' : '') + '>' + esc(o[1]) + '</option>').join('') + '</select>';
+}
+function viewSettings(d) {
+  const st = (d && d.settings) || { gate: 'strict', unit: 'px', remBase: 16, colorFormat: 'hex', previewFonts: 'google', svgFrames: 'auto' };
+  tabHeader('Settings', 'Processing, output and integrations', '');
+  const lim = (d && d.limits) || {};
+  const run = lim.run || {};
+  let html = '';
+  html += card('Processing',
+    settingRow('Dev-ready gate', 'Strict hides everything not marked ready', selectBox('set-gate', st.gate, [['strict', 'Strict'], ['off', 'Off']])) +
+    settingRow('Vector illustrations', 'Export artwork frames as one SVG instead of markup', selectBox('set-svg', st.svgFrames || 'auto', [['auto', 'Automatic'], ['named', 'Named or SVG-exported only'], ['off', 'Never (convert every layer)']])));
+  html += card('Output',
+    settingRow('Units', '', selectBox('set-unit', st.unit, [['px', 'Pixels'], ['rem', 'Rem']])) +
+    settingRow('Rem base', 'Compared with Figma scale factor', selectBox('set-base', String(st.remBase), [['12', '12'], ['14', '14'], ['16', '16'], ['18', '18']])) +
+    settingRow('Colours', '', selectBox('set-color', st.colorFormat, [['hex', 'Hex'], ['rgb', 'RGB'], ['hsl', 'HSL']])) +
+    settingRow('Preview fonts', 'Public Google Fonts only', selectBox('set-fonts', st.previewFonts, [['google', 'Load Google Fonts'], ['off', 'No network in preview']])));
+  html += card('Limits',
+    '<div class="kv"><span>Layers walked</span><b>' + (run.maxNodes || 6000).toLocaleString() + '</b></div>' +
+    '<div class="kv"><span>Layers per generation</span><b>' + (run.maxGenerateNodes || 2500).toLocaleString() + '</b></div>' +
+    '<div class="kv"><span>Nesting depth</span><b>' + (run.maxDepth || 120) + '</b></div>' +
+    '<div class="kv"><span>Snapshot size</span><b>' + bytesLabel(lim.snapBytes || 400000) + '</b></div>' +
+    '<div class="kv"><span>Accessibility scan</span><b>' + (lim.a11yLimit || 400) + ' layers</b></div>' +
+    '<div class="faint" style="margin-top:6px">Limits are enforced, not advisory: past them DevReady truncates and says so rather than hanging.</div>');
+  html += card('GitHub',
+    ghConnected()
+      ? '<div class="kv"><span>Connected</span><b>' + esc(S.gh.status.login) + '</b></div><div class="row-btns" style="margin-top:6px"><button class="btn" data-act="gh-disconnect">Disconnect</button></div>'
+      : '<div class="faint">Not connected. GitHub is optional — everything else works offline.</div>');
+  html += card('Local data',
+    '<div class="kv"><span>Projects</span><b>' + (wsEnsure().projects.length) + '</b></div>' +
+    '<div class="kv"><span>Revisions kept</span><b>' + (histEnsure().list.length) + '</b></div>' +
+    '<div class="row-btns" style="margin-top:6px"><button class="btn" data-act="data-clear">Clear local data</button></div>' +
+    '<div class="faint" style="margin-top:6px">Projects and revisions live in Figma\'s plugin storage on this machine — not in the file, not on a server.</div>');
+  $('main').innerHTML = html;
+}
+
+/* ---------- dispatch ---------- */
+function renderTabView(d) {
+  if (S.tab === 'overview') return viewOverview(d);
+  if (S.tab === 'files') return viewFiles(d);
+  if (S.tab === 'code') return viewCode(d);
+  if (S.tab === 'assets') return viewAssets(d);
+  if (S.tab === 'history') return viewHistory(d);
+  if (S.tab === 'github') return viewGithub(d);
+  return viewSettings(d);
+}
+/** Actions owned by the workspace. Returns true when handled. */
+function appAction(act, el) {
+  if (act === 'tab') { setTab(el.getAttribute('data-tab')); return true; }
+  if (act === 'proj-menu') { menuFor('proj-menu', el); return true; }
+  if (act === 'proj-new') { wsNewProject(); return true; }
+  if (act === 'proj-create') { wsCreateNamed(($('proj-name') || {}).value || (S.projForm && S.projForm.name)); return true; }
+  if (act === 'proj-save') { wsRenameTo(($('proj-name') || {}).value || (S.projForm && S.projForm.name)); return true; }
+  if (act === 'proj-form-cancel') { S.projForm = null; render(); return true; }
+  if (act === 'proj-rename') { wsRename(); return true; }
+  if (act === 'proj-dup') { wsDuplicate(); return true; }
+  if (act === 'proj-del') { wsDelete(); return true; }
+  if (act === 'proj-archive') { wsArchive(); return true; }
+  if (act === 'proj-switch') { wsSwitch(el.getAttribute('data-id')); return true; }
+  if (act === 'proj-sort') { S.projView.sort = el.getAttribute('data-sort'); render(); return true; }
+  if (act === 'proj-archived') { S.projView.archived = !S.projView.archived; render(); return true; }
+  if (act === 'proj-add-file') { wsAddFile(); return true; }
+  if (act === 'files-add') { wsAddFile(); return true; }
+  if (act === 'files-run-all') { filesRun(false); return true; }
+  if (act === 'files-retry') { filesRun(true); return true; }
+  if (act === 'files-cancel') { filesCancel(); return true; }
+  if (act === 'files-run') { filesRunOne(el.getAttribute('data-id')); return true; }
+  if (act === 'files-rm') { wsRemoveFile(el.getAttribute('data-id')); return true; }
+  if (act === 'files-lang') { S.run.lang = el.getAttribute('data-lang'); render(); return true; }
+  if (act === 'code-dl') { codeDownload(el.getAttribute('data-name')); return true; }
+  if (act === 'code-dl-all') { codeDownloadAll(); return true; }
+  if (act === 'code-open-files') { setTab('files'); return true; }
+  if (act === 'code-push') {
+    const lc = S.lastCode;
+    if (!lc || !lc.files || !lc.files.length) { toast('Generate code first'); return true; }
+    S.gh.msg = 'Update from DevReady · ' + (lc.nodeName || 'design');
+    setTab('github');
+    return true;
+  }
+  if (act === 'proj-rm-file') { wsRemoveFile(el.getAttribute('data-id')); return true; }
+  if (act === 'assets-all') { S.assetsView.all = !S.assetsView.all; render(); return true; }
+  if (act === 'assets-kind') { S.assetsView.kind = el.getAttribute('data-kind'); render(); return true; }
+  if (act === 'assets-export-all') {
+    if (S.demo) { toast('Export works inside Figma'); return true; }
+    const items = filteredAssets().map(a => ({ id: a.id, format: a.kind === 'illustration' || a.kind === 'icon' ? 'SVG' : 'PNG', scale: 2 }));
+    if (!items.length) { toast('No assets to export'); return true; }
+    send({ type: 'export-all', items: items, zipName: 'assets.zip' });
+    toast('Exporting ' + items.length + ' assets…');
+    return true;
+  }
+  if (act === 'hist-cmp') { S.hist.cmp = S.hist.cmp === el.getAttribute('data-id') ? null : el.getAttribute('data-id'); render(); return true; }
+  if (act === 'hist-restore') { histRestore(el.getAttribute('data-id')); return true; }
+  if (act === 'gh-connect') {
+    const f = $('gh-token');
+    const token = f ? f.value.trim() : '';
+    if (!/^[A-Za-z0-9_]{20,255}$/.test(token)) { toast('Paste a GitHub token (ghp_… or github_pat_…)'); return true; }
+    S.gh.busy = 'connect'; S.gh.error = null; render();
+    send({ type: 'gh-connect', token: token });
+    return true;
+  }
+  if (act === 'gh-disconnect') { send({ type: 'gh-disconnect' }); return true; }
+  if (act === 'gh-repos') { S.gh.busy = 'repos'; S.gh.error = null; render(); send({ type: 'gh-repos' }); return true; }
+  if (act === 'gh-repos-all') { S.gh.reposAll = !S.gh.reposAll; render(); return true; }
+  if (act === 'gh-pick') {
+    S.gh.repo = el.getAttribute('data-repo'); S.gh.branches = []; S.gh.branch = ''; S.gh.tree = null; S.gh.result = null; S.gh.files = {};
+    S.gh.busy = 'branches'; render();
+    send({ type: 'gh-branches', repo: S.gh.repo });
+    return true;
+  }
+  if (act === 'gh-branches') { if (!S.gh.repo) return true; S.gh.busy = 'branches'; render(); send({ type: 'gh-branches', repo: S.gh.repo }); return true; }
+  if (act === 'gh-branch') { S.gh.branch = el.getAttribute('data-branch'); S.gh.tree = null; render(); return true; }
+  if (act === 'gh-create') {
+    const name = ($('gh-new-name') || {}).value || '';
+    if (!/^[A-Za-z0-9._-]{1,100}$/.test(name.trim())) { toast('Use letters, numbers, dot, dash or underscore'); return true; }
+    S.gh.busy = 'create'; render();
+    send({ type: 'gh-create-repo', name: name.trim(), private: !!(($('gh-new-private') || {}).checked), description: ($('gh-new-desc') || {}).value || '' });
+    return true;
+  }
+  if (act === 'gh-preview') {
+    if (!S.gh.repo) { toast('Pick a repository first'); return true; }
+    const nb = $('gh-branch-new');
+    if (nb && nb.value.trim()) S.gh.branch = nb.value.trim();
+    if (!S.gh.branch) { toast('Pick a branch first'); return true; }
+    // Send the files so the plugin can compare git blob hashes: that is what makes
+    // "modified" different from "unchanged", and it keeps identical content out of
+    // the commit. Above 1.5 MB the comparison is skipped and paths are shown instead.
+    const files = ghLocalFiles();
+    let bytes = 0;
+    files.forEach(f => { bytes += String(f.content || '').length; });
+    const payload = bytes <= 1500000 ? files.slice(0, 200) : undefined;
+    S.gh.busy = 'tree'; S.gh.compared = !!payload; render();
+    send({ type: 'gh-tree', repo: S.gh.repo, branch: S.gh.branch, files: payload });
+    return true;
+  }
+  if (act === 'gh-push') {
+    const rows = ghPreviewRows().rows.filter(f => S.gh.files[f.path] !== false);
+    const files = rows.filter(f => f.status !== 'unchanged');
+    if (!rows.length) { toast('Select at least one file'); return true; }
+    if (!files.length) { toast('Those files already match the repository — nothing to push'); return true; }
+    const msg = ($('gh-msg') || {}).value || S.gh.msg || 'Update from DevReady';
+    S.gh.msg = msg;
+    S.gh.busy = 'push'; S.gh.error = null; S.gh.result = null; render();
+    send({
+      type: 'gh-commit', repo: S.gh.repo, branch: S.gh.branch, message: msg.slice(0, 500),
+      baseSha: (S.gh.tree && S.gh.tree.headSha) || '', createBranch: !(S.gh.branches || []).some(b => b.name === S.gh.branch),
+      files: files.map(f => (f.del ? { path: f.path, content: '', del: true } : { path: f.path, content: f.content }))
+    });
+    return true;
+  }
+  if (act === 'data-clear') {
+    if (S.confirm !== 'clear-data') { S.confirm = 'clear-data'; render(); toast('Press again to clear projects and revisions'); return true; }
+    S.confirm = null; S.ws = null; S.hist = { list: [], open: null, cmp: null };
+    send({ type: 'store-set', key: 'projects', value: '{"projects":[],"active":""}' });
+    send({ type: 'store-set', key: 'history', value: '{"list":[]}' });
+    wsEnsure(); render(); toast('Local data cleared');
+    return true;
+  }
+  return false;
+}
+
+/* ---------- workspace events ---------- */
+document.addEventListener('keydown', e => {
+  const t = e.target;
+  if (!t || !t.closest || !t.closest('#tabs')) return;
+  const i = TABS.findIndex(x => x.id === S.tab);
+  let n = -1;
+  if (e.key === 'ArrowRight') n = (i + 1) % TABS.length;
+  else if (e.key === 'ArrowLeft') n = (i - 1 + TABS.length) % TABS.length;
+  else if (e.key === 'Home') n = 0;
+  else if (e.key === 'End') n = TABS.length - 1;
+  if (n < 0) return;
+  e.preventDefault();
+  setTab(TABS[n].id);
+  const btn = $('tab-' + TABS[n].id);
+  if (btn) btn.focus();
+});
+document.addEventListener('input', e => {
+  const t = e.target;
+  if (!t || !t.id) return;
+  if (t.id === 'assets-q') {
+    S.assetsView.q = t.value;
+    const box = document.querySelector('#main');
+    if (box) { const pos = t.selectionStart; render(); const el = $('assets-q'); if (el) { el.focus(); try { el.setSelectionRange(pos, pos); } catch (err) { /* ignore */ } } }
+  } else if (t.id === 'gh-repo-q') { S.gh.q = t.value; render(); const el = $('gh-repo-q'); if (el) el.focus(); }
+  else if (t.id === 'gh-msg') { S.gh.msg = t.value; }
+});
+document.addEventListener('change', e => {
+  const t = e.target;
+  if (!t || !t.id) return;
+  const map = { 'set-gate': 'gate', 'set-unit': 'unit', 'set-base': 'remBase', 'set-color': 'colorFormat', 'set-fonts': 'previewFonts', 'set-svg': 'svgFrames' };
+  const key = map[t.id];
+  if (key) {
+    const v = key === 'remBase' ? +t.value : t.value;
+    setSetting({ [key]: v });
+    return;
+  }
+  if (t.id === 'proj-name') { if (S.projForm) S.projForm.name = t.value; return; }
+  if (t.id === 'proj-q') { S.projView.q = t.value; const v2 = viewState(); renderNow(); restoreView(v2); return; }
+  if (t.getAttribute('data-act') === 'gh-toggle-file') {
+    S.gh.files[t.getAttribute('data-path')] = t.checked;
+    render();
+  }
+});
+
 window.onmessage = ev => {
   // Figma delivers plugin messages from the parent frame. Direct calls without a
   // source (the browser test harness) are still accepted.
   if (ev.source && window.parent && ev.source !== window.parent) return;
   const m = ev.data && ev.data.pluginMessage; if (!m) return;
-  if (['loading', 'state', 'code', 'download', 'error', 'thumb', 'project', 'design-shot', 'fonts-updated', 'ann-result', 'tokens'].indexOf(m.type) === -1) return;
+  if (['loading', 'state', 'code', 'download', 'error', 'thumb', 'project', 'design-shot', 'fonts-updated', 'ann-result', 'tokens',
+    'plan', 'store', 'store-ok', 'store-error', 'gh-status', 'gh-repos', 'gh-branches', 'gh-created', 'gh-tree', 'gh-committed'].indexOf(m.type) === -1) return;
   S.got = true; S.demo = false;
   if (m.type === 'loading') $('bar').classList.add('on');
   else if (m.type === 'state') {
@@ -1712,8 +2658,16 @@ window.onmessage = ev => {
     document.querySelectorAll('[data-thumb="' + CSS.escape(m.id) + '"]').forEach(x => { x.innerHTML = '<img src="' + S.thumbs[m.id] + '" alt="">'; });
   }
   else if (m.type === 'code') {
+    // A project queue run answers here, not through the inspector's request map.
+    if (filesSettle(m)) return;
+    if (!m.cancelled && m.out && m.out.files && m.out.files.length) lastCodeFrom(m.lang, m.nodeId, null, m.out);
     if (!S.codeFor || m.nodeId !== S.codeFor || !m.requestId || pending[m.lang] !== m.requestId) return;
-    S.code[m.lang] = m.out; pending[m.lang] = false; render();
+    S.code[m.lang] = m.out; pending[m.lang] = false;
+    if (!m.cancelled && m.out && m.out.files && m.out.files.length) {
+      try { histPush(m.lang, m.out.files); } catch (e) { /* history is best-effort */ }
+      activate('Generated ' + m.lang + ' (' + m.out.files.length + ' files)');
+    }
+    render();
     if (m.out.assetErrors && m.out.assetErrors.length) toast(m.out.assetErrors.length + ' asset export issue' + (m.out.assetErrors.length === 1 ? '' : 's') + ' — retry in Figma before downloading');
   }
   else if (m.type === 'tokens') { S.tok = S.tok || { format: m.format, scope: m.scope }; S.tok.busy = false; S.tok.diag = m.diagnostics || []; S.tok.out = Object.assign({ format: m.format, scope: m.scope }, m.out); render(); }
@@ -1737,6 +2691,56 @@ window.onmessage = ev => {
     toast('Project downloaded');
   }
   else if (m.type === 'error') { $('bar').classList.remove('on'); toast(m.message); }
+  else if (m.type === 'plan') {
+    S.plan = m;
+    if (S.tab === 'overview') render();
+  }
+  else if (m.type === 'store') {
+    if (m.key === 'projects' && m.value && Array.isArray(m.value.projects) && m.value.projects.length) { S.ws = m.value; if (S.tab === 'overview') render(); }
+    else if (m.key === 'projects') { wsEnsure(); if (S.tab === 'overview') render(); }
+    else if (m.key === 'history' && m.value && Array.isArray(m.value.list)) { S.hist = { list: m.value.list, open: null, cmp: null }; if (S.tab === 'history') render(); }
+  }
+  else if (m.type === 'store-ok') { /* silent */ }
+  else if (m.type === 'store-error') { toast('Could not save locally: ' + m.message); }
+  else if (m.type === 'gh-status') {
+    S.gh.pending = false;
+    S.gh.status = m.status || { connected: false };
+    S.gh.busy = '';
+    if (S.gh.status.connected) { S.gh.error = null; S.gh.busy = 'repos'; send({ type: 'gh-repos' }); }
+    if (S.tab === 'github' || S.tab === 'settings') render();
+  }
+  else if (m.type === 'gh-repos') {
+    S.gh.busy = '';
+    if (m.ok) { S.gh.repos = m.repos || []; S.gh.error = null; }
+    else S.gh.error = m.error;
+    if (S.tab === 'github') render();
+  }
+  else if (m.type === 'gh-branches') {
+    S.gh.busy = '';
+    if (m.ok) {
+      S.gh.branches = m.branches || [];
+      if (!S.gh.branch || !S.gh.branches.some(b => b.name === S.gh.branch)) S.gh.branch = (S.gh.branches[0] || {}).name || '';
+      S.gh.error = null;
+    } else S.gh.error = m.error;
+    if (S.tab === 'github') render();
+  }
+  else if (m.type === 'gh-created') {
+    S.gh.busy = '';
+    if (m.ok && m.repo) { S.gh.repo = m.repo.fullName; S.gh.branch = m.repo.defaultBranch; S.gh.branches = [{ name: m.repo.defaultBranch }]; S.form = null; toast('Repository created'); send({ type: 'gh-repos' }); }
+    else if (m.error) { S.gh.error = m.error; toast(m.error.message); }
+    if (S.tab === 'github') render();
+  }
+  else if (m.type === 'gh-tree') {
+    S.gh.busy = '';
+    if (m.ok) { S.gh.tree = m; S.gh.error = null; } else S.gh.error = m.error;
+    if (S.tab === 'github') render();
+  }
+  else if (m.type === 'gh-committed') {
+    S.gh.busy = '';
+    if (m.ok) { S.gh.result = m.result; S.gh.error = null; S.gh.tree = null; activate('Pushed ' + m.result.files + ' files to ' + m.result.branch); }
+    else { S.gh.error = m.error; toast('GitHub: ' + (m.error && m.error.message || 'push failed')); }
+    if (S.tab === 'github') render();
+  }
 };
 
 (function () {
@@ -1806,6 +2810,9 @@ const DEMO_THUMBS = {
 
 render();
 send({ type: 'ui-ready' });
+send({ type: 'store-get', key: 'projects' });
+send({ type: 'store-get', key: 'history' });
+send({ type: 'plan' });
 setTimeout(() => {
   if (S.got) return;
   S.demo = true; S.data = JSON.parse(JSON.stringify(DEMO));

@@ -60,11 +60,23 @@ published to Figma Community, it will work anywhere.
 
 ### Does it send my design anywhere?
 
-No. **`code.js` makes no network requests.** Font classification uses a catalog of
-1,950 Google Fonts bundled into the plugin, so even a private font name never leaves
-Figma. The single exception is the *preview* iframe loading **public Google Fonts** so
-the HTML renders in the design's typeface; turn it off with
-**⋯ → Load Google Fonts in preview** for zero traffic. See [PRIVACY.md](../PRIVACY.md).
+Not unless you ask it to. Font classification uses a catalog of 1,950 Google Fonts
+bundled into the plugin, so even a private font name never leaves Figma. There are two
+network paths, both optional:
+
+1. the *preview* iframe loading **public Google Fonts** so the HTML renders in the
+   design's typeface — turn it off with **⋯ → Load Google Fonts in preview**;
+2. **GitHub publishing**, which only happens if you paste a token and press *Push*. It
+   sends the generated files you selected to your own repository.
+
+Code generation, inspection, tokens, exports and change tracking never touch the
+network. See [PRIVACY.md](../PRIVACY.md) and [PUBLISHING.md](PUBLISHING.md).
+
+### Does it push my code to GitHub automatically?
+
+No. The GitHub tab is inert until you connect a token, and even then nothing is written
+until you preview the changes, choose files and press *Commit & push*. Details and the
+required permissions: [PUBLISHING.md](PUBLISHING.md).
 
 ### The generated code doesn't match the design exactly
 

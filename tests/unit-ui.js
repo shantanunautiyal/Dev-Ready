@@ -56,6 +56,9 @@ function loadPanel() {
     CSS: { escape: s => String(s) },
     localStorage: { getItem() { return null; }, setItem() {} }
   };
+  // Record everything the panel sends to the plugin thread.
+  const sent = [];
+  sandbox.parent.postMessage = m => { sent.push(m && m.pluginMessage ? m.pluginMessage : m); };
   sandbox.window = sandbox;
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
@@ -63,9 +66,15 @@ function loadPanel() {
   // `const` declarations at the top level of a script are lexical bindings, not
   // properties of the context object, so read them by evaluating an expression.
   const api = {};
-  ['esc', 'fmtColor', 'ago', 'fmtDate', 'makeZip', 'hl', 'resIcon', 'host', 'I', 'S', 'hsl', 'rgbaCss', 'secDiagnostics', 'diagNote'].forEach(name => {
+  ['esc', 'fmtColor', 'ago', 'fmtDate', 'makeZip', 'hl', 'resIcon', 'host', 'I', 'S', 'hsl', 'rgbaCss', 'secDiagnostics', 'diagNote',
+    'renderTabs', 'render', 'renderNow', 'appAction', 'setTab', 'viewGithub', 'viewAssets', 'viewHistory', 'viewSettings',
+    'viewOverview', 'histPush', 'histDiffHtml', 'lineDiff', 'filteredAssets', 'wsEnsure', 'wsActive', '$', 'document',
+    'projList', 'wsArchive', 'wsNewProject', 'wsRename', 'wsCreateNamed', 'wsRenameTo', 'uniqueName', 'ghPreviewRows', 'ghLocalFiles', 'viewFiles', 'viewCode', 'filesRun', 'filesRunOne', 'filesCancel', 'filesSettle', 'codeDownloadAll', 'lastCodeFrom'].forEach(name => {
     Object.defineProperty(api, name, { get: () => vm.runInContext(name, sandbox), enumerable: true });
   });
+  api.get = name => vm.runInContext(name, sandbox);
+  api.sent = sent;
+  api.onmessage = msg => sandbox.window.onmessage({ data: { pluginMessage: msg } });
   return api;
 }
 
@@ -224,3 +233,6 @@ module.exports = async function uiUnitTests(record) {
     record('panel', 'dev-resource icons and host display (link safety)', errs);
   }
 };
+
+// Exposed for the workspace tests (tests/platform.js).
+module.exports.loadPanel = loadPanel;

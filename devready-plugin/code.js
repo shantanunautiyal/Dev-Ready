@@ -41,7 +41,12 @@ const DEFAULT_SETTINGS = {
   remBase: 16,
   colorFormat: 'hex',    // 'hex' | 'rgb' | 'hsl'
   pluginFlag: true,      // also accept the plugin's own "ready" flag (for free plans / Dev Mode)
-  previewFonts: 'google' // 'google' = preview loads public Google Fonts, 'off' = no network at all
+  previewFonts: 'google', // 'google' = preview loads public Google Fonts, 'off' = no network at all
+  // Vector illustrations become one SVG asset instead of a tree of divs.
+  // 'auto'  = illustrations by name, explicit SVG export or sheer vector complexity
+  // 'named' = only frames whose name says so, or that export as SVG
+  // 'off'   = every frame is converted element by element (previous behaviour)
+  svgFrames: 'auto'
 };
 let settings = Object.assign({}, DEFAULT_SETTINGS);
 
@@ -70,15 +75,24 @@ const V = {
   opt: f => v => v === undefined || v === null || v === '' ? '' : f(v)
 };
 const EXPORT_ITEM = { id: V.id, format: V.oneOf(['PNG', 'JPG', 'SVG', 'PDF']), scale: V.num(0.5, 4) };
-const SETTINGS_SCHEMA = { gate: V.oneOf(['strict', 'off']), unit: V.oneOf(['px', 'rem']), remBase: V.int(8, 32), colorFormat: V.oneOf(['hex', 'rgb', 'hsl']), pluginFlag: V.bool, previewFonts: V.oneOf(['google', 'off']) };
+const SETTINGS_SCHEMA = { gate: V.oneOf(['strict', 'off']), unit: V.oneOf(['px', 'rem']), remBase: V.int(8, 32), colorFormat: V.oneOf(['hex', 'rgb', 'hsl']), pluginFlag: V.bool, previewFonts: V.oneOf(['google', 'off']), svgFrames: V.oneOf(['auto', 'named', 'off']) };
+/* GitHub identifiers. Validated before any request is built, so a hostile
+   payload cannot redirect the adapter at another host or path. */
+const GH_NAME_RE = /^[A-Za-z0-9._-]{1,100}$/;
+const GH_REPO_RE = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+const GH_BRANCH_RE = /^[A-Za-z0-9._\/-]{1,200}$/;
+/* Never absolute, never a parent segment, no control characters, no .git trickery. */
+const GH_PATH_RE = /^(?!\/)(?!.*(?:^|\/)\.\.?(?:\/|$))(?!.*\.git(?:\/|$))[A-Za-z0-9._@+ -]{1,120}(?:\/[A-Za-z0-9._@+ -]{1,120})*$/;
+const GH_MAX_FILES = 200;
+const GH_MAX_BYTES = 4 * 1024 * 1024;
 const MSG_SCHEMA = {
   'ui-ready': {}, 'measure-native': {}, 'measure-clear': {}, 'notes-clear': {}, 'redlines': {}, 'clear-redlines': {},
   'settings': { settings: v => { if (!v || typeof v !== 'object') return undefined; const o = {}; Object.keys(SETTINGS_SCHEMA).forEach(k => { if (k in v) { const x = SETTINGS_SCHEMA[k](v[k]); if (x !== undefined) o[k] = x; } }); return o; } },
-  'select': { id: V.id }, 'goto': { id: V.id }, 'design-shot': { id: V.id }, 'baseline-save': { id: V.id }, 'baseline-clear': { id: V.id },
+  'select': { id: V.id }, 'goto': { id: V.id }, 'design-shot': { id: V.id }, 'thumb-request': { id: V.id }, 'baseline-save': { id: V.id }, 'baseline-clear': { id: V.id },
   'mark': { id: V.id, status: V.opt(V.oneOf(['READY_FOR_DEV', 'COMPLETED'])), note: V.str(2000) },
   'export': EXPORT_ITEM,
   'export-all': { items: v => Array.isArray(v) ? v.slice(0, 300).map(i => checkFields(i || {}, EXPORT_ITEM)).filter(Boolean) : undefined, zipName: V.opt(V.re(/^[\w .\-]{1,100}\.zip$/, 104)) },
-  'gen-code': { lang: V.oneOf(LANG_IDS), requestId: V.opt(V.int(1, Number.MAX_SAFE_INTEGER)), nodeId: V.opt(V.id) }, 'tokens-export': { format: V.oneOf(['css', 'scss', 'json', 'tailwind']), scope: V.oneOf(['selection', 'file']) }, 'export-project': { lang: V.oneOf(LANG_IDS) },
+  'gen-code': { lang: V.oneOf(LANG_IDS), requestId: V.opt(V.int(1, Number.MAX_SAFE_INTEGER)), nodeId: V.opt(V.id), jobId: V.opt(V.int(1, Number.MAX_SAFE_INTEGER)) }, 'tokens-export': { format: V.oneOf(['css', 'scss', 'json', 'tailwind']), scope: V.oneOf(['selection', 'file']) }, 'export-project': { lang: V.oneOf(LANG_IDS) },
   'font-upload': { family: V.re(/^[^|]{1,100}$/, 100), key: V.re(/^[01],[1-9]00$/, 5), ext: V.oneOf(['woff2', 'woff', 'ttf', 'otf']), bytes: V.bytes(2.5 * 1024 * 1024), name: V.str(200), last: V.bool },
   'font-remove': { family: V.re(/^[^|]{1,100}$/, 100), key: V.re(/^[01],[1-9]00$/, 5) },
   'annotate-add': { id: V.id, label: V.str(5000), prop: V.opt(V.re(/^[A-Za-z]{1,40}$/, 40)), cat: V.opt(V.re(/^[\w:;\-]{1,200}$/, 200)), color: V.opt(V.oneOf(['yellow', 'orange', 'red', 'pink', 'violet', 'blue', 'teal', 'green'])), pin: V.bool },
@@ -87,7 +101,51 @@ const MSG_SCHEMA = {
   'map-save': { key: V.re(/^[\w:;\-]{1,200}$/, 200), name: V.re(MAP_NAME_RE, 80), path: V.opt(V.re(MAP_PATH_RE, 200)) },
   'map-remove': { key: V.re(/^[\w:;\-]{1,200}$/, 200) },
   'notify': { text: V.str(300), error: V.bool },
-  'resize': { w: V.num(360, 1600), h: V.num(420, 1600) }
+  'resize': { w: V.num(360, 1600), h: V.num(420, 1600) },
+  /* Long jobs can be cancelled. The id is chosen by the panel so a stale cancel
+     can never stop a newer run. */
+  'cancel': { jobId: V.int(1, Number.MAX_SAFE_INTEGER) },
+  /* Per-layer plan: is it an illustration, how expensive is it, can it be generated. */
+  'plan': {},
+  /* Workspace state (projects, local revisions) lives in clientStorage, never in
+     the document. Only these keys are readable, and only as bounded JSON. */
+  'store-get': { key: V.oneOf(['projects', 'history']) },
+  'store-set': { key: V.oneOf(['projects', 'history']), value: V.re(/^[\s\S]{2,600000}$/, 600000) },
+  /* GitHub — optional, token-based, every call user-initiated. */
+  'gh-status': {}, 'gh-disconnect': {},
+  'gh-connect': { token: V.re(/^\S{20,255}$/, 255) },
+  'gh-repos': {},
+  'gh-branches': { repo: V.re(/^\S{1,300}$/, 300) },
+  'gh-tree': {
+    repo: V.re(/^\S{1,300}$/, 300),
+    branch: V.opt(V.re(/^\S{0,200}$/, 200)),
+    // The panel sends the files it would push so the preview can compare hashes.
+    files: v => {
+      if (!Array.isArray(v) || v.length > GH_MAX_FILES) return undefined;
+      return v.slice(0, GH_MAX_FILES).map(f => ({
+        path: f && typeof f.path === 'string' ? f.path.slice(0, 300) : '',
+        content: f && typeof f.content === 'string' ? f.content.slice(0, GH_MAX_BYTES) : ''
+      }));
+    }
+  },
+  'gh-create-repo': { name: V.re(GH_NAME_RE, 100), private: V.bool, description: V.str(200) },
+  'gh-commit': {
+    // Shape only: paths, counts, sizes and refs are validated by ghCommit(), which
+    // answers with an error code instead of leaving the panel waiting.
+    repo: V.re(/^\S{1,300}$/, 300),
+    branch: V.re(/^\S{1,200}$/, 200),
+    message: V.re(/^[^\u0000-\u0008]{0,500}$/, 500),
+    baseSha: V.opt(V.re(/^[^\s]{0,40}$/, 40)),
+    createBranch: V.bool,
+    files: v => {
+      if (!Array.isArray(v) || v.length > 500) return undefined;
+      return v.slice(0, 500).map(f => ({
+        path: f && typeof f.path === 'string' ? f.path.slice(0, 300) : '',
+        content: f && typeof f.content === 'string' ? f.content : '',
+        del: !!(f && f.del)
+      }));
+    }
+  }
 };
 /** Returns a cleaned copy with only schema fields, or null if a required field is invalid. */
 function checkFields(src, schema, bad) {
@@ -860,14 +918,146 @@ function isIconLike(n) {
   }
   return false;
 }
-function collectAssets(root, limit) {
+/* ------------------------------------------------------------------ */
+/* Vector illustrations: one asset, not a hundred divs                 */
+/* A frame that is nothing but paths, shapes and boolean operations is  */
+/* artwork. Converting each inner path into markup produces hundreds of */
+/* unreachable nodes that never match the design pixel for pixel; the    */
+/* whole frame is exported as one SVG instead. Frames that contain text, */
+/* instances, components or raster paint stay UI and are converted.      */
+/* ------------------------------------------------------------------ */
+const ILLUSTRATION_HINT = /(illustration|artwork|vector|logo|mascot|drawing|graphic|diagram|hero.?art|sketch|painting|isometric)/i;
+/* A semantic UI name beats a coincidence: "Icon button", "Logo link" are UI. */
+const UI_NAME_HINT = /(button|btn|input|field|form|nav|menu|header|footer|toolbar|tab|card|modal|dialog|table|row|list|item|link|badge|chip|avatar|checkbox|radio|toggle|slider|tooltip|dropdown|select|search|pagination|breadcrumb|alert|banner|toast)/i;
+
+/** Bounded scan: what is actually inside this layer? */
+function vectorScan(node) {
+  const st = { nodes: 0, vectors: 0, maxDepth: 0, allVector: true, svgExport: false, text: 0, instances: 0, raster: 0 };
+  (function walk(n, depth) {
+    if (st.nodes > ASSET_WALK_LIMIT || depth > MAX_DEPTH) { st.allVector = false; return; }
+    if (n.visible === false) return;
+    st.nodes++;
+    st.maxDepth = Math.max(st.maxDepth, depth);
+    if (depth === 0) {
+      const es = 'exportSettings' in n ? n.exportSettings : [];
+      st.svgExport = es.some(e => e && String(e.format).toUpperCase() === 'SVG');
+    }
+    if (n.type === 'TEXT') st.text++;
+    else if (n.type === 'INSTANCE' || n.type === 'COMPONENT' || n.type === 'COMPONENT_SET') st.instances++;
+    if (hasImageFill(n)) st.raster++;
+    if (VECTORISH[n.type]) st.vectors++;
+    if (!('children' in n)) {
+      if (!VECTORISH[n.type] && n.type !== 'GROUP' && n.type !== 'BOOLEAN_OPERATION') st.allVector = false;
+      return;
+    }
+    if (n.type === 'BOOLEAN_OPERATION') return; // its children are consumed by the boolean
+    for (const c of n.children) walk(c, depth + 1);
+  })(node, 0);
+  if (st.text || st.instances || st.raster) st.allVector = false;
+  return st;
+}
+
+/**
+ * Decide whether a layer is a self-contained illustration that should ship as one
+ * SVG. Returns null for UI, or { reason, vectors, nodes, depth } for artwork.
+ * mode: 'auto' (default) | 'named' (name or explicit SVG export only) | 'off'.
+ */
+function illustrationPlan(node, mode) {
+  if (!node || node.visible === false || mode === 'off') return null;
+  if (typeof node.width !== 'number' || typeof node.height !== 'number') return null;
+  if (node.width <= 0 || node.height <= 0) return null;
+  const st = vectorScan(node);
+  if (!st.allVector || st.raster) return null;
+  if (st.vectors < 2) return null;                 // a single shape is not an illustration
+  if (st.nodes > ASSET_WALK_LIMIT) return null;    // too big to be one sane asset
+  if (st.maxDepth > 48) return null;               // deeply nested artwork exports poorly
+  const name = String(node.name || '');
+  const named = ILLUSTRATION_HINT.test(name) && !UI_NAME_HINT.test(name);
+  const complex = st.vectors >= 12 && (node.width > 256 || node.height > 256);
+  const stats = { vectors: st.vectors, nodes: st.nodes, depth: st.maxDepth };
+  if (st.svgExport) return Object.assign({ reason: 'svg-export' }, stats);
+  if (named) return Object.assign({ reason: 'name' }, stats);
+  if (mode === 'auto' && complex) return Object.assign({ reason: 'complexity' }, stats);
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
+/* Complexity assessment & limits                                      */
+/* ------------------------------------------------------------------ */
+const RUN_LIMITS = {
+  maxNodes: 6000,          // layers we will walk to describe a design
+  maxGenerateNodes: 2500,  // layers per code generation (the engine truncates past this)
+  maxDepth: MAX_DEPTH,
+  maxAssets: 400,
+  maxMs: 15000,
+  maxStoreKb: 200
+};
+/**
+ * Estimate how expensive a layer is before generating anything, so the panel can
+ * warn, offer a smaller selection or refuse, instead of freezing. Bounded: it
+ * stops at 6000 nodes and says so.
+ */
+function assessComplexity(node) {
+  const out = { nodes: 0, depth: 0, text: 0, vectors: 0, instances: 0, images: 0, components: 0, clipped: false, level: 'small', estimatedMs: 0, warnings: [] };
+  if (!node) return out;
+  (function walk(n, depth) {
+    if (out.nodes >= RUN_LIMITS.maxNodes || depth > MAX_DEPTH) { out.clipped = true; return; }
+    if (n.visible === false) return;
+    out.nodes++;
+    out.depth = Math.max(out.depth, depth);
+    if (n.type === 'TEXT') out.text++;
+    else if (VECTORISH[n.type]) out.vectors++;
+    else if (n.type === 'INSTANCE') out.instances++;
+    else if (n.type === 'COMPONENT' || n.type === 'COMPONENT_SET') out.components++;
+    if (hasImageFill(n)) out.images++;
+    if ('children' in n) n.children.forEach(c => walk(c, depth + 1));
+  })(node, 0);
+  // Deliberately conservative: a layout pass per node, an export per vector asset
+  // and a raster export per image fill.
+  out.estimatedMs = Math.round(out.nodes * 0.4 + out.vectors * 1.2 + out.images * 25);
+  out.level = out.nodes > 4000 ? 'extreme' : out.nodes > 1200 ? 'large' : out.nodes > 300 ? 'medium' : 'small';
+  if (out.clipped) out.warnings.push('This layer has more than ' + RUN_LIMITS.maxNodes.toLocaleString('en-US') + ' layers - counts stop there.');
+  if (out.depth > 80) out.warnings.push('Nesting is ' + out.depth + ' levels deep; layers past ' + MAX_DEPTH + ' are omitted.');
+  if (out.images > 40) out.warnings.push(out.images + ' image fills: exporting them takes a while.');
+  if (out.nodes > RUN_LIMITS.maxGenerateNodes) out.warnings.push('Past ' + RUN_LIMITS.maxGenerateNodes.toLocaleString('en-US') + ' layers the code is truncated - select a child frame for the rest.');
+  return out;
+}
+
+/** Bounded local storage (clientStorage) for projects and revision history. */
+async function storeGet(key) {
+  try {
+    const raw = await figma.clientStorage.getAsync('devready-' + key);
+    if (!raw) return null;
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (e) { diag('local storage', e); return null; }
+}
+async function storeSet(key, json) {
+  const text = String(json || '');
+  if (text.length > RUN_LIMITS.maxStoreKb * 1024) {
+    throw new Error('That is too much data to keep locally (' + Math.round(text.length / 1024) + ' kB, limit ' + RUN_LIMITS.maxStoreKb + ' kB).');
+  }
+  const parsed = JSON.parse(text); // reject garbage before it is persisted
+  await figma.clientStorage.setAsync('devready-' + key, JSON.stringify(parsed));
+  return true;
+}
+
+function collectAssets(root, limit, svgMode) {
   const out = [];
   let visited = 0;
+  const mode = svgMode || 'auto';
   (function walk(n, depth) {
     if (out.length >= limit || visited++ > 4000) return;
     if (depth > MAX_DEPTH) return;
     if (n.visible === false) return;
     const hasExport = 'exportSettings' in n && n.exportSettings.length > 0;
+    if (n !== root) {
+      const illo = illustrationPlan(n, mode);
+      if (illo) {
+        out.push({ id: n.id, name: n.name, type: n.type, kind: 'illustration', reason: illo.reason, vectors: illo.vectors, formats: ['SVG'], w: round(n.width), h: round(n.height) });
+        return;
+      }
+    }
     if (hasExport) {
       out.push({ id: n.id, name: n.name, type: n.type, kind: 'export', formats: n.exportSettings.map(e => e.format + (e.constraint && e.constraint.type === 'SCALE' && e.constraint.value !== 1 ? '@' + e.constraint.value + 'x' : '')), w: round(n.width), h: round(n.height) });
       return;
@@ -1023,7 +1213,13 @@ function applyGeometry(node, el, isRoot) {
   if (container && node.clipsContent && !c.overflow) c.overflow = 'hidden';
   return el;
 }
+const JOBS = {};
+const ghReposCache = [];
+/* A cancelled job stops at the next layer instead of running to completion. */
+const CANCEL = { cancelled: true };
+function jobCancelled(ctx) { return !!(ctx && ctx.job && ctx.job.cancelled); }
 async function buildRaw(node, ctx, isRoot, inInst, depth) {
+  if (jobCancelled(ctx)) throw CANCEL;
   return applyGeometry(node, await buildRawNode(node, ctx, isRoot, inInst, depth || 0), isRoot);
 }
 async function buildRawNode(node, ctx, isRoot, inInst, depth) {
@@ -1062,6 +1258,33 @@ async function buildRawNode(node, ctx, isRoot, inInst, depth) {
 
   const hasExport = 'exportSettings' in node && node.exportSettings.length > 0;
   const leafImage = hasImageFill(node) && !('children' in node && node.children.length);
+  // Self-contained vector artwork (illustrations, logos, complex diagrams) is one
+  // SVG asset. Its inner paths never become markup: they are unreachable nodes that
+  // cannot match the design pixel for pixel. A selected illustration frame is
+  // included, so generating code for artwork produces an image, not a guess.
+  const illo = illustrationPlan(node, ctx.svgFrames);
+  if (illo) {
+    el.kind = 'img'; el.tag = 'img';
+    el.base = 'illustration';
+    el.illustration = illo;
+    el.attrs.alt = node.name || 'Illustration';
+    const key = node.id;
+    let file = ctx.assetByKey[key];
+    if (!file) {
+      const baseName = cleanName(node.name) || 'illustration';
+      let fname = baseName, i = 1;
+      while (ctx.assetNames[fname]) fname = baseName + '-' + (++i);
+      ctx.assetNames[fname] = 1;
+      file = { id: node.id, file: fname + '.svg', format: 'SVG', scale: 1, varName: camel(fname) + 'Illustration', illustration: illo.reason };
+      ctx.assetByKey[key] = file;
+      ctx.assets.push(file);
+    }
+    el.asset = file;
+    const css = { width: round(node.width) + 'px', height: round(node.height) + 'px' };
+    LAYOUT_KEYS.forEach(k => { if (el.css[k] !== undefined) css[k] = el.css[k]; });
+    el.css = css;
+    return el;
+  }
   // TEXT stays accessible, selectable text even when a designer gave it export
   // settings. Asset export belongs to the Assets panel; it must not rasterise copy.
   if (node.type !== 'TEXT' && !isRoot && (isIconLike(node) || hasExport || leafImage)) {
@@ -1895,8 +2118,11 @@ function singleHtml(node, root, ctx, unit, base, note) {
 async function generateCodeInner(node, lang, unit, base, maxNodes, opts) {
   opts = opts || {};
   const isReact = /^react-/.test(lang);
+  const svgMode = opts.svgFrames || settings.svgFrames || 'auto';
   const ctx = { lang: lang, count: 0, max: maxNodes || 600, truncated: false, maxFont: 0, assets: [], assetByKey: {}, assetNames: {}, vars: {}, classes: {}, order: [], weights: {}, usedTitle: false, rootWidth: node.width,
     varIds: {}, themes: {}, tokenInfo: {}, imports: {}, fonts: {}, react: isReact, mappings: isReact ? loadMappings() : {} };
+  ctx.svgFrames = svgMode;
+  ctx.job = opts.job || null;
   const root = await buildRaw(node, ctx, true, false, 0);
   if (!root) return { files: [{ name: 'empty.txt', lang: 'text', code: 'Nothing visible to generate.' }], assets: [] };
   await resolveAutoLineHeights(root, ctx, lang);
@@ -1930,6 +2156,8 @@ async function generateCodeInner(node, lang, unit, base, maxNodes, opts) {
   if (ctx.depthLimited) notes.push('Layer tree deeper than ' + MAX_DEPTH + ' levels — nested layers beyond that are omitted. Select a child frame for the rest.');
   if (ctx.truncated && !ctx.depthLimited) notes.push('Output truncated after ' + ctx.max + ' layers — select a smaller frame for full code.');
   if (ctx.autoLineHeight) notes.push(ctx.autoLineHeight + ' text layer' + (ctx.autoLineHeight === 1 ? '' : 's') + ' could not be measured; browser font metrics can differ. Set an explicit line-height for pixel-exact output.');
+  const illos = (ctx.assets || []).filter(a => a.illustration);
+  if (illos.length) notes.push(illos.length + ' vector illustration' + (illos.length === 1 ? '' : 's') + ' exported as SVG (' + illos.slice(0, 3).map(a => a.file).join(', ') + (illos.length > 3 ? ', ...' : '') + '). Inner vector layers are not converted to code.');
   if (ctx.assetErrors && ctx.assetErrors.length) notes.push(ctx.assetErrors.length + ' asset export issue' + (ctx.assetErrors.length === 1 ? '' : 's') + ' — download the project for details or retry in Figma.');
   const note = notes.join(' ');
   const files = [];
@@ -1992,7 +2220,7 @@ async function generateCodeInner(node, lang, unit, base, maxNodes, opts) {
   }
   return {
     files: files,
-    assets: ctx.assets.filter(a => !a.src && !a.svg).map(a => ({ id: a.id, file: a.file, format: a.format, scale: a.scale, imageHash: a.imageHash || '', cssOnly: !!a.cssOnly })),
+    assets: ctx.assets.filter(a => !a.src && !a.svg).map(a => ({ id: a.id, file: a.file, format: a.format, scale: a.scale, imageHash: a.imageHash || '', cssOnly: !!a.cssOnly, illustration: a.illustration || '' })),
     fonts: fontPlan.families,
     fontFiles: opts.withFonts ? fontPlan.files : undefined,
     preview: { w: round(node.width), h: round(node.height), inlinedKB: Math.round(inlined / 1024) },
@@ -2011,6 +2239,7 @@ async function generateCode(node, lang, unit, base, maxNodes, opts) {
   try {
     return await generateCodeInner(node, lang, unit, base, maxNodes, opts);
   } catch (e) {
+    if (e === CANCEL) return { files: [], assets: [], fonts: [], cancelled: true, truncated: false, stats: {} };
     const msg = String((e && e.message) || e).slice(0, 300);
     return {
       files: [{ name: 'error.txt', lang: 'text', code: 'DevReady could not generate code for this layer.\n\n' + msg + '\n\nTry selecting a smaller frame, or a child frame of the design.' }],
@@ -3606,6 +3835,358 @@ async function buildTokens(format, scope, node, unit, base) {
   return { text: text, file: (format === 'tailwind' ? 'theme' : 'tokens') + '.' + ext, lang: format === 'json' ? 'json' : 'css', stats: stats, empty: !toks.length && !stats.styles };
 }
 
+/* ------------------------------------------------------------------ */
+/* GitHub - optional, token-based, user-initiated only                 */
+/*                                                                     */
+/* A Figma plugin has no server, so an OAuth client secret cannot be   */
+/* kept: the safest supported flow is a fine-grained personal access   */
+/* token with "Contents: read and write" on the chosen repositories.    */
+/* The token lives in clientStorage on this machine, is attached to     */
+/* requests here in the plugin thread, and is never sent to the panel,  */
+/* written to the document, or included in generated code or logs.      */
+/* ------------------------------------------------------------------ */
+const GH_API = 'https://api.github.com';
+const GH_TIMEOUT_MS = 20000;
+let ghTokenCache;
+let ghTokenLoaded = false;
+
+async function ghToken() {
+  if (ghTokenLoaded) return ghTokenCache || null;
+  ghTokenLoaded = true;
+  try {
+    const t = await figma.clientStorage.getAsync('devready-github-token');
+    ghTokenCache = typeof t === 'string' && t ? t : null;
+  } catch (e) { ghTokenCache = null; diag('GitHub token', e); }
+  return ghTokenCache;
+}
+async function ghSetToken(t) {
+  ghTokenCache = t || null;
+  ghTokenLoaded = true;
+  try {
+    if (t) await figma.clientStorage.setAsync('devready-github-token', t);
+    else await figma.clientStorage.deleteAsync('devready-github-token');
+  } catch (e) { diag('GitHub token', e); }
+}
+/** Belt and braces: no token-shaped string ever leaves this module. */
+function ghScrub(text) {
+  let out = String(text == null ? '' : text);
+  if (ghTokenCache) out = out.split(ghTokenCache).join('[redacted]');
+  out = out.replace(/\b(?:gh[pousr]_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{10,})\b/g, '[redacted]');
+  return out.slice(0, 300);
+}
+function ghErrorOf(status, body, headers) {
+  const msg = body && body.message ? String(body.message) : '';
+  const remaining = headers && headers['x-ratelimit-remaining'];
+  const reset = headers && headers['x-ratelimit-reset'];
+  if (status === 0) return { code: 'network', message: msg || 'Could not reach GitHub. Check your connection and try again.' };
+  if (status === 401) return { code: 'auth', message: 'GitHub rejected the token. It may have expired or been revoked — reconnect GitHub.' };
+  if (status === 403 && String(remaining) === '0') {
+    const when = reset ? new Date(+reset * 1000).toLocaleTimeString() : 'later';
+    return { code: 'rate-limit', message: 'GitHub rate limit reached. Try again after ' + when + '.' };
+  }
+  if (status === 403) return { code: 'permission', message: 'The token cannot do that. It needs "Contents: read and write" (and "Administration: write" to create repositories).' };
+  if (status === 404) return { code: 'not-found', message: msg || 'Not found — or the token cannot see this repository.' };
+  if (status === 409 || status === 422) return { code: 'conflict', message: msg || 'The branch moved while committing. Refresh the changes and try again.' };
+  if (status >= 500) return { code: 'unavailable', message: 'GitHub is unavailable right now (' + status + '). Try again in a moment.' };
+  return { code: 'http-' + status, message: msg || ('GitHub returned ' + status + '.') };
+}
+
+function ghWithTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const timer = setTimeout(() => { if (!done) { done = true; reject({ code: 'timeout', message: 'GitHub did not answer within ' + Math.round(ms / 1000) + ' s.' }); } }, ms);
+    promise.then(v => { if (!done) { done = true; clearTimeout(timer); resolve(v); } },
+      e => { if (!done) { done = true; clearTimeout(timer); reject(e); } });
+  });
+}
+
+/**
+ * One place where GitHub is called. Adds auth, version pinning, a timeout, a single
+ * retry for transient failures and uniform error mapping. Returns
+ * { ok, status, body, headers, rate, error } and never throws.
+ */
+async function ghRequest(path, opts) {
+  opts = opts || {};
+  if (typeof path !== 'string' || path[0] !== '/' || /[\s\u0000]/.test(path) || path.length > 400) {
+    return { ok: false, status: 0, error: { code: 'bad-path', message: 'Invalid GitHub request.' } };
+  }
+  const token = await ghToken();
+  if (!token) return { ok: false, status: 0, error: { code: 'not-connected', message: 'Connect GitHub first.' } };
+  const attempt = async () => {
+    const headers = {
+      'Accept': 'application/vnd.github+json',
+      'Authorization': 'Bearer ' + token,
+      'X-GitHub-Api-Version': '2022-11-28'
+    };
+    if (opts.body) headers['Content-Type'] = 'application/json';
+    const init = { method: opts.method || 'GET', headers: headers };
+    if (opts.body) init.body = JSON.stringify(opts.body);
+    const res = await ghWithTimeout(fetch(GH_API + path, init), GH_TIMEOUT_MS);
+    let text;
+    try { text = await res.text(); } catch (e) { /* empty body */ }
+    let body = null;
+    if (text) { try { body = JSON.parse(text); } catch (e) { body = null; } }
+    const headersOut = {};
+    ['x-ratelimit-remaining', 'x-ratelimit-reset', 'x-oauth-scopes'].forEach(k => {
+      try { if (res.headers && res.headers.get) headersOut[k] = res.headers.get(k); } catch (e) { /* ignore */ }
+    });
+    return { res: res, body: body, headers: headersOut };
+  };
+  let result;
+  try {
+    result = await attempt();
+  } catch (e) {
+    if (e && e.code === 'timeout') return { ok: false, status: 0, error: { code: 'timeout', message: ghScrub(e.message) } };
+    return { ok: false, status: 0, error: { code: 'network', message: ghScrub((e && e.message) || 'Could not reach GitHub.') } };
+  }
+  const status = result.res && typeof result.res.status === 'number' ? result.res.status : 0;
+  const ok = result.res && result.res.ok !== false && status >= 200 && status < 300;
+  // One retry for a transient server error on a read. Writes are never retried
+  // automatically: a retried commit can duplicate history.
+  if (!ok && (opts.method || 'GET') === 'GET' && status >= 500 && !opts.retried) {
+    await new Promise(r => setTimeout(r, 300));
+    return ghRequest(path, Object.assign({}, opts, { retried: true }));
+  }
+  return {
+    ok: ok, status: status, body: result.body, headers: result.headers,
+    rate: result.headers['x-ratelimit-remaining'], error: ok ? null : ghErrorOf(status, result.body, result.headers)
+  };
+}
+
+/* --- repository & account operations --- */
+
+async function ghStatus() {
+  const token = await ghToken();
+  if (!token) return { connected: false };
+  const r = await ghRequest('/user');
+  if (!r.ok) return { connected: false, stale: true, error: r.error };
+  const b = r.body || {};
+  return { connected: true, login: b.login, name: b.name || '', avatar: b.avatar_url || '', scopes: r.headers['x-oauth-scopes'] || '', rate: r.rate };
+}
+
+async function ghRepos() {
+  const r = await ghRequest('/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member');
+  if (!r.ok) return { ok: false, error: r.error };
+  const list = (Array.isArray(r.body) ? r.body : []).slice(0, 100).map(x => ({
+    fullName: x.full_name || '', private: !!x.private, defaultBranch: x.default_branch || 'main',
+    updatedAt: x.updated_at || '', description: x.description || '', empty: !x.size
+  }));
+  return { ok: true, repos: list };
+}
+
+async function ghBranches(repo) {
+  if (!GH_REPO_RE.test(String(repo))) return { ok: false, error: { code: 'bad-repo', message: 'Pick a repository first.' } };
+  const r = await ghRequest('/repos/' + repo + '/branches?per_page=100');
+  if (!r.ok) return { ok: false, error: r.error };
+  return { ok: true, branches: (Array.isArray(r.body) ? r.body : []).slice(0, 100).map(b => ({ name: b.name, sha: b.commit && b.commit.sha, protected: !!(b.protected) })) };
+}
+
+async function ghCreateRepo(opts) {
+  const name = String(opts && opts.name || '');
+  if (!GH_NAME_RE.test(name)) return { ok: false, error: { code: 'bad-name', message: 'Repository names may use letters, numbers, dot, dash and underscore.' } };
+  const body = { name: name, private: opts.private !== false, description: String(opts.description || '').slice(0, 200), auto_init: true };
+  const r = await ghRequest('/user/repos', { method: 'POST', body: body });
+  if (!r.ok) return { ok: false, error: r.error };
+  const b = r.body || {};
+  return { ok: true, repo: { fullName: b.full_name, defaultBranch: b.default_branch || 'main', private: !!b.private, url: b.html_url } };
+}
+
+/** Remote file list (paths only), for the commit preview. */
+/* ---------- git blob hashes ---------- */
+/**
+ * Git's object name for a file: SHA-1 of "blob <bytes>\0" + the UTF-8 content.
+ * With it the preview can say added / modified / unchanged exactly, and a push
+ * whose tree would be identical to the parent can be refused instead of creating
+ * an empty commit.
+ */
+function utf8Of(text) {
+  const out = [];
+  const str = String(text == null ? '' : text);
+  for (let i = 0; i < str.length; i++) {
+    let c = str.charCodeAt(i);
+    if (c < 0x80) out.push(c);
+    else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+      const low = str.charCodeAt(i + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        c = 0x10000 + ((c - 0xd800) << 10) + (low - 0xdc00);
+        i++;
+        out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+      } else out.push(0xef, 0xbf, 0xbd);
+    } else if (c >= 0xd800 && c <= 0xdfff) out.push(0xef, 0xbf, 0xbd);
+    else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+  }
+  return out;
+}
+function sha1Hex(bytes) {
+  const ml = bytes.length * 8;
+  const buf = bytes.slice();
+  buf.push(0x80);
+  while (buf.length % 64 !== 56) buf.push(0);
+  const hi = Math.floor(ml / 0x100000000), lo = ml >>> 0;
+  buf.push((hi >>> 24) & 255, (hi >>> 16) & 255, (hi >>> 8) & 255, hi & 255);
+  buf.push((lo >>> 24) & 255, (lo >>> 16) & 255, (lo >>> 8) & 255, lo & 255);
+  let h0 = 0x67452301, h1 = 0xefcdab89, h2 = 0x98badcfe, h3 = 0x10325476, h4 = 0xc3d2e1f0;
+  const w = new Array(80);
+  const rol = (n, k) => ((n << k) | (n >>> (32 - k))) >>> 0;
+  for (let i = 0; i < buf.length; i += 64) {
+    for (let j = 0; j < 16; j++) {
+      w[j] = (buf[i + j * 4] << 24) | (buf[i + j * 4 + 1] << 16) | (buf[i + j * 4 + 2] << 8) | buf[i + j * 4 + 3];
+    }
+    for (let j = 16; j < 80; j++) w[j] = rol(w[j - 3] ^ w[j - 8] ^ w[j - 14] ^ w[j - 16], 1);
+    let a = h0, b = h1, c = h2, d = h3, e = h4;
+    for (let j = 0; j < 80; j++) {
+      let f, k;
+      if (j < 20) { f = (b & c) | (~b & d); k = 0x5a827999; }
+      else if (j < 40) { f = b ^ c ^ d; k = 0x6ed9eba1; }
+      else if (j < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc; }
+      else { f = b ^ c ^ d; k = 0xca62c1d6; }
+      const t = (rol(a, 5) + (f >>> 0) + e + k + (w[j] >>> 0)) >>> 0;
+      e = d; d = c; c = rol(b, 30); b = a; a = t;
+    }
+    h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0; h4 = (h4 + e) >>> 0;
+  }
+  return [h0, h1, h2, h3, h4].map(h => ('00000000' + h.toString(16)).slice(-8)).join('');
+}
+function gitBlobSha(text) {
+  const body = utf8Of(text);
+  const head = utf8Of('blob ' + body.length + '\u0000');
+  return sha1Hex(head.concat(body));
+}
+
+async function ghRemoteFiles(repo, branch, local) {
+  if (!GH_REPO_RE.test(String(repo))) return { ok: false, error: { code: 'bad-repo', message: 'Pick a repository first.' } };
+  if (branch && !GH_BRANCH_RE.test(String(branch))) return { ok: false, error: { code: 'bad-branch', message: 'Invalid branch name.' } };
+  const ref = branch || 'HEAD';
+  const r = await ghRequest('/repos/' + repo + '/git/trees/' + encodeURIComponent(ref) + '?recursive=1');
+  // An empty repository (no commits yet) answers 404/409: that is a valid state,
+  // not a failure — everything local is then "added".
+  if (!r.ok && (r.status === 404 || r.status === 409)) {
+    // Empty repository: every local file is new, and nothing is deleted.
+    const fresh = (Array.isArray(local) ? local : [])
+      .filter(f => f && typeof f.path === 'string' && GH_PATH_RE.test(f.path))
+      .slice(0, GH_MAX_FILES)
+      .map(f => ({ path: f.path, status: 'added', sha: gitBlobSha(f.content) }));
+    return { ok: true, files: [], headSha: '', empty: true, truncated: false, local: fresh, deleted: [] };
+  }
+  if (!r.ok) return { ok: false, error: r.error };
+  const remote = {};
+  const blobs = (r.body && Array.isArray(r.body.tree) ? r.body.tree : []).filter(x => x.type === 'blob');
+  blobs.slice(0, 2000).forEach(x => { remote[x.path] = { sha: x.sha, size: x.size }; });
+  const head = branch ? await ghRef(repo, branch) : { ok: true, sha: '' };
+  const files = Object.keys(remote).map(path => ({ path: path, sha: remote[path].sha, size: remote[path].size }));
+  const out = { ok: true, files: files, headSha: (head && head.sha) || '', empty: false, truncated: !!(r.body && r.body.truncated) };
+
+  // Compare against the files the panel is about to send, when it sent them.
+  if (Array.isArray(local) && local.length) {
+    const mine = {};
+    local.slice(0, GH_MAX_FILES).forEach(f => {
+      if (!f || typeof f.path !== 'string' || !GH_PATH_RE.test(f.path)) return;
+      mine[f.path] = gitBlobSha(f.content);
+    });
+    out.local = Object.keys(mine).map(path => {
+      const known = remote[path];
+      return { path: path, status: !known ? 'added' : known.sha === mine[path] ? 'unchanged' : 'modified', sha: mine[path] };
+    });
+    out.deleted = Object.keys(remote).filter(path => mine[path] === undefined).map(path => ({ path: path, status: 'deleted', sha: remote[path].sha }));
+  }
+  return out;
+}
+
+async function ghDefaultBranch(repo) {
+  const r = await ghRequest('/repos/' + repo);
+  if (!r.ok) return { ok: false, error: r.error };
+  return { ok: true, branch: (r.body && r.body.default_branch) || 'main' };
+}
+
+async function ghRef(repo, branch) {
+  const r = await ghRequest('/repos/' + repo + '/git/ref/heads/' + encodeURIComponent(branch));
+  if (r.ok) return { ok: true, sha: r.body && r.body.object && r.body.object.sha, exists: true };
+  if (r.status === 404 || r.status === 409) return { ok: true, sha: null, exists: false };
+  return { ok: false, error: r.error };
+}
+
+/**
+ * Publish generated files as one commit.
+ *  1. resolve the branch head (optionally verifying the sha the panel previewed)
+ *  2. create blobs, a tree on top of the head, and a commit
+ *  3. move the branch with force:false, so a concurrent push is rejected, not lost
+ * Nothing is written until every blob exists, and a failed push leaves the branch
+ * untouched and retryable.
+ */
+async function ghCommit(job) {
+  const repo = String(job.repo || '');
+  const branch = String(job.branch || '');
+  const files = job.files || [];
+  if (!GH_REPO_RE.test(repo)) return { ok: false, error: { code: 'bad-repo', message: 'Pick a repository first.' } };
+  if (!GH_BRANCH_RE.test(branch) || branch.indexOf('..') > -1) return { ok: false, error: { code: 'bad-branch', message: 'Invalid branch name.' } };
+  if (!files.length) return { ok: false, error: { code: 'no-files', message: 'Nothing selected to commit.' } };
+  if (files.length > GH_MAX_FILES) return { ok: false, error: { code: 'too-many', message: 'Select at most ' + GH_MAX_FILES + ' files.' } };
+  let total = 0;
+  for (const f of files) {
+    if (!GH_PATH_RE.test(f.path)) return { ok: false, error: { code: 'bad-path', message: 'Unsafe file path: ' + String(f.path).slice(0, 120) } };
+    total += String(f.content || '').length;
+  }
+  if (total > GH_MAX_BYTES) return { ok: false, error: { code: 'too-large', message: 'The selected files are ' + Math.round(total / 1024) + ' kB; the limit is ' + Math.round(GH_MAX_BYTES / 1024) + ' kB.' } };
+
+  const head = await ghRef(repo, branch);
+  if (!head.ok) return { ok: false, error: head.error };
+  let parentSha = head.sha;
+  if (!head.exists) {
+    if (!job.createBranch) return { ok: false, error: { code: 'no-branch', message: 'Branch "' + branch + '" does not exist. Create it from the default branch first.' } };
+    const def = await ghDefaultBranch(repo);
+    if (!def.ok) return { ok: false, error: def.error };
+    const base = await ghRef(repo, def.branch);
+    if (!base.ok) return { ok: false, error: base.error };
+    parentSha = base.sha;
+    if (!parentSha) return { ok: false, error: { code: 'no-branch', message: 'The repository has no commits yet. Add a README on GitHub, then try again.' } };
+  }
+  // The panel previewed against a specific head; if it moved, stop before writing.
+  if (job.baseSha && head.exists && job.baseSha !== parentSha) {
+    return { ok: false, error: { code: 'conflict', message: 'The branch moved since you previewed these changes (' + String(parentSha).slice(0, 7) + '). Preview again to see the new state.' } };
+  }
+
+  const commitRes = await ghRequest('/repos/' + repo + '/git/commits/' + parentSha);
+  if (!commitRes.ok) return { ok: false, error: commitRes.error };
+  const baseTree = commitRes.body && commitRes.body.tree && commitRes.body.tree.sha;
+
+  const entries = [];
+  for (const f of files) {
+    if (f.del) {
+      // `sha: null` removes the path from the tree; no blob is written.
+      entries.push({ path: f.path, mode: '100644', type: 'blob', sha: null });
+      continue;
+    }
+    const blob = await ghRequest('/repos/' + repo + '/git/blobs', { method: 'POST', body: { content: f.content, encoding: 'utf-8' } });
+    if (!blob.ok) return { ok: false, error: blob.error, stage: 'blob', file: f.path };
+    entries.push({ path: f.path, mode: '100644', type: 'blob', sha: blob.body && blob.body.sha });
+  }
+  const tree = await ghRequest('/repos/' + repo + '/git/trees', { method: 'POST', body: { base_tree: baseTree, tree: entries } });
+  if (!tree.ok) return { ok: false, error: tree.error, stage: 'tree' };
+  if (tree.body && tree.body.sha && baseTree && tree.body.sha === baseTree) {
+    // Nothing would actually change: an empty commit is worse than an honest refusal.
+    return { ok: false, error: { code: 'no-changes', message: 'Every selected file already matches the repository — there is nothing to commit.' }, stage: 'tree' };
+  }
+  const commit = await ghRequest('/repos/' + repo + '/git/commits', {
+    method: 'POST',
+    body: { message: String(job.message || 'Update from DevReady').slice(0, 500), tree: tree.body && tree.body.sha, parents: [parentSha] }
+  });
+  if (!commit.ok) return { ok: false, error: commit.error, stage: 'commit' };
+  const sha = commit.body && commit.body.sha;
+
+  const moved = head.exists
+    ? await ghRequest('/repos/' + repo + '/git/refs/heads/' + encodeURIComponent(branch), { method: 'PATCH', body: { sha: sha, force: false } })
+    : await ghRequest('/repos/' + repo + '/git/refs', { method: 'POST', body: { ref: 'refs/heads/' + branch, sha: sha } });
+  if (!moved.ok) {
+    const err = moved.error;
+    // 422 on a non-forced ref update means the branch advanced underneath us.
+    if (moved.status === 422) return { ok: false, error: { code: 'conflict', message: 'Someone pushed to "' + branch + '" while committing. Nothing was overwritten — preview and try again.' }, stage: 'push' };
+    return { ok: false, error: err, stage: 'push' };
+  }
+  return { ok: true, sha: sha, branch: branch, repo: repo, files: files.length, created: !head.exists,
+    url: 'https://github.com/' + repo + '/commit/' + sha };
+}
+
 /* ---------- Prototype interactions ---------- */
 const TRIGGERS = { ON_CLICK: 'On click', ON_HOVER: 'On hover', ON_PRESS: 'On press', ON_DRAG: 'On drag', MOUSE_ENTER: 'Mouse enter', MOUSE_LEAVE: 'Mouse leave',
   MOUSE_UP: 'Mouse up', MOUSE_DOWN: 'Mouse down', WHILE_HOVERING: 'While hovering', WHILE_PRESSED: 'While pressing', ON_KEY_DOWN: 'Key / gamepad', ON_MEDIA_HIT: 'Media hits time', ON_MEDIA_END: 'Media ends' };
@@ -3841,7 +4422,8 @@ if (figma.mode === 'codegen') {
     const my = ++reqId;
     clearDiagnostics(); // notes describe this pass only
     const sel = figma.currentPage.selection;
-    const base = { editor: figma.editorType, isDev: IS_DEV, settings: settings, limits: { maxDepth: MAX_DEPTH, snapLimit: SNAP_LIMIT, a11yLimit: 400 } };
+    const base = { editor: figma.editorType, isDev: IS_DEV, settings: settings,
+      limits: { maxDepth: MAX_DEPTH, snapLimit: SNAP_LIMIT, snapBytes: SNAP_BYTES, a11yLimit: 400, run: RUN_LIMITS } };
 
     if (!sel.length) {
       lastSegments = [];
@@ -3895,7 +4477,8 @@ if (figma.mode === 'codegen') {
     try { a11y = a11yAudit(node, 400); } catch (e) { /* audit is best-effort */ }
     if (my !== reqId) return;
 
-    const assets = collectAssets(node, 60);
+    const assets = collectAssets(node, 120, settings.svgFrames);
+    const complexity = assessComplexity(node);
     // Include the selected node itself as the first asset row
     assets.unshift({ id: node.id, name: node.name, type: node.type, kind: 'selection', w: round(node.width), h: round(node.height) });
 
@@ -3911,6 +4494,7 @@ if (figma.mode === 'codegen') {
       changes: changes,
       a11y: a11y,
       assets: assets,
+      complexity: complexity,
       diagnostics: takeDiagnostics()
     }, base));
 
@@ -4037,8 +4621,112 @@ if (figma.mode === 'codegen') {
             } });
             break;
           }
-          const out = await generateCode(node, msg.lang, settings.unit, settings.remBase, 600);
-          post({ type: 'code', lang: msg.lang, requestId: msg.requestId || '', nodeId: node.id, out: out });
+          const job = { id: msg.jobId || 0, cancelled: false };
+          if (job.id) JOBS[job.id] = job;
+          let out;
+          try {
+            out = await generateCode(node, msg.lang, settings.unit, settings.remBase, 600, { job: job, svgFrames: settings.svgFrames });
+          } finally {
+            if (job.id) delete JOBS[job.id];
+          }
+          post({ type: 'code', lang: msg.lang, requestId: msg.requestId || '', nodeId: node.id, out: out, cancelled: !!out.cancelled });
+          break;
+        }
+        case 'cancel': {
+          const job = JOBS[msg.jobId];
+          if (job) job.cancelled = true;
+          break;
+        }
+        case 'thumb-request': {
+          // Thumbnails are small PNGs; the panel asks for the ones it actually shows.
+          try {
+            const n = await figma.getNodeByIdAsync(msg.id);
+            if (n && 'exportAsync' in n) {
+              const big = Math.max(n.width, n.height) || 1;
+              const bytes = await n.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: Math.min(4, 160 / big) } });
+              post({ type: 'thumb', id: n.id, bytes: bytes });
+            }
+          } catch (e) { diag('thumbnail', e); }
+          break;
+        }
+        case 'plan': {
+          // Cheap pre-flight for the panel: classification + cost, nothing generated.
+          const sel = figma.currentPage.selection.slice(0, 50);
+          const nodes = sel.map(n => {
+            const complexity = assessComplexity(n);
+            const illo = illustrationPlan(n, settings.svgFrames);
+            return {
+              id: n.id, name: n.name, type: n.type,
+              illustration: illo ? { reason: illo.reason, vectors: illo.vectors, nodes: illo.nodes } : null,
+              complexity: complexity
+            };
+          });
+          post({ type: 'plan', nodes: nodes, limits: RUN_LIMITS, svgFrames: settings.svgFrames });
+          break;
+        }
+        case 'store-get': {
+          post({ type: 'store', key: msg.key, value: await storeGet(msg.key) });
+          break;
+        }
+        case 'store-set': {
+          try {
+            await storeSet(msg.key, msg.value);
+            post({ type: 'store-ok', key: msg.key });
+          } catch (e) {
+            post({ type: 'store-error', key: msg.key, message: String((e && e.message) || e).slice(0, 200) });
+          }
+          break;
+        }
+        case 'gh-status': {
+          const st = await ghStatus();
+          post({ type: 'gh-status', status: st });
+          break;
+        }
+        case 'gh-connect': {
+          await ghSetToken(msg.token);
+          const st = await ghStatus();
+          if (!st.connected) {
+            await ghSetToken(null);
+            post({ type: 'gh-status', status: { connected: false, error: st.error || { code: 'auth', message: 'GitHub did not accept that token.' } } });
+            break;
+          }
+          figma.notify('GitHub connected as ' + st.login);
+          post({ type: 'gh-status', status: st });
+          break;
+        }
+        case 'gh-disconnect': {
+          await ghSetToken(null);
+          ghReposCache.length = 0;
+          figma.notify('GitHub disconnected — the token was removed from this machine');
+          post({ type: 'gh-status', status: { connected: false } });
+          break;
+        }
+        case 'gh-repos': {
+          const r = await ghRepos();
+          post({ type: 'gh-repos', ok: r.ok, repos: r.repos || [], error: r.error || null });
+          break;
+        }
+        case 'gh-branches': {
+          const r = await ghBranches(msg.repo);
+          post({ type: 'gh-branches', ok: r.ok, repo: msg.repo, branches: r.branches || [], error: r.error || null });
+          break;
+        }
+        case 'gh-create-repo': {
+          const r = await ghCreateRepo(msg);
+          post({ type: 'gh-created', ok: r.ok, repo: r.repo || null, error: r.error || null });
+          break;
+        }
+        case 'gh-tree': {
+          const r = await ghRemoteFiles(msg.repo, msg.branch, msg.files);
+          post({ type: 'gh-tree', ok: r.ok, repo: msg.repo, branch: msg.branch, files: r.files || [], local: r.local || [],
+            deleted: r.deleted || [], headSha: r.headSha || '', empty: !!r.empty, truncated: !!r.truncated, error: r.error || null });
+          break;
+        }
+        case 'gh-commit': {
+          const r = await ghCommit(msg);
+          if (r.ok) figma.notify('Pushed ' + r.files + ' file' + (r.files === 1 ? '' : 's') + ' to ' + r.repo + ' · ' + r.branch);
+          else figma.notify('GitHub: ' + r.error.message, { error: true });
+          post({ type: 'gh-committed', ok: r.ok, result: r.ok ? { sha: r.sha, url: r.url, branch: r.branch, files: r.files, created: r.created } : null, error: r.error || null, stage: r.stage || '' });
           break;
         }
         case 'tokens-export': {
@@ -4060,7 +4748,7 @@ if (figma.mode === 'codegen') {
         case 'export-project': {
           const sel = figma.currentPage.selection;
           if (!sel.length) break;
-          const out = await generateCode(sel[0], msg.lang, settings.unit, settings.remBase, 1500, { withFonts: true });
+          const out = await generateCode(sel[0], msg.lang, settings.unit, settings.remBase, 1500, { withFonts: true, svgFrames: settings.svgFrames });
           const files = out.files.map(f => ({ name: f.name, text: f.code }));
           (out.fontFiles || []).forEach(f => files.push({ name: f.name, bytes: f.bytes }));
           const failures = (out.assetErrors || []).slice();

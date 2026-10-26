@@ -1049,10 +1049,13 @@ Copy this into an issue per phase.
 
 ---
 
-## Appendix — implementation status (2026-10-26)
+## Appendix — implementation status (2026-10-27)
 
-The suite has grown from 158 to **192 checks** while every item below landed; `npm test`,
+The suite has grown from 158 to **213 checks** while every item below landed; `npm test`,
 `npm run lint` and `npm run check` are green after each batch.
+
+The second appendix below (`Appendix B`) records the multi-file / illustration / GitHub
+work, which is a different axis from the review items.
 
 ### Shipped
 
@@ -1082,3 +1085,46 @@ target compile checks, browser-level UI tests, and the fixture catalogue in §8
 
 *The backlog above is unchanged and still describes the remaining work; this appendix only
 records what has already been built and verified.*
+
+---
+
+## Appendix B — multi-file workspace, illustrations and GitHub (2026-10-27)
+
+Delivered in the same release as the appendix above; `tests/platform.js` (21 checks) is the
+regression net for all of it.
+
+| Requested | Status | Where it lives |
+|---|---|---|
+| Multiple design files per project, per-file status and progress | **Shipped** | `ui.html` → Design Files tab; one request in flight, progress meter, `idle/running/ok/error` per entry, status persisted in `devready-projects` |
+| Selective processing | **Shipped** | per-row *Generate*, *Generate all*, and the selection itself (the inspector's language/menu) |
+| Retry failed operations | **Shipped** | *Retry N failed* re-queues only `status: 'error'` entries |
+| Duplicate / conflicting runs on one file | **Shipped** | a second run is refused while one is in flight; the queue is sequential |
+| Illustration frames exported as one SVG | **Shipped** | `illustrationPlan()` (name / SVG export / vector density), `svgFrames: auto\|named\|off`, `cleanSvg()`, `<img src="assets/*.svg" alt="…">` |
+| UI frames, forms, buttons, nav still become code | **Shipped + tested** | frames containing text, an instance or a raster fill are never classified as artwork; `illustrations never become SVG artwork` test |
+| Unsupported vector features, malformed SVG, oversized assets, export failure | **Shipped** | export failure degrades to element output with a note; `cleanSvg` rejects the markup; oversized/undecodable entries surface in `assetErrors` |
+| Input validation, complexity estimation, limits | **Shipped** | `validateMsg` schemas for every message, `assessComplexity()`, `RUN_LIMITS`, `storeSet` byte cap |
+| Cancellation, timeouts | **Shipped** | `CANCEL` sentinel checked per layer, `cancel` message with `jobId`, 20 s panel timeout |
+| Adaptive batching, concurrency limit, backpressure/dedupe | **Partial (by design)** | generation is sequential with one job per panel; the asset walk and snapshot are bounded. Figma's plugin sandbox is single-threaded, so real parallelism is impossible — the queue is the batching layer |
+| Checkpoints / recovery, never silently drop content | **Shipped** | project state and progress in `clientStorage`; truncation, partial snapshots, clipped complexity and failed assets are always reported |
+| GitHub connect, repos, branches, preview, commit, push | **Shipped (opt-in)** | `ghRequest`/`ghCommit` adapter; token in `clientStorage`; see `docs/PUBLISHING.md` |
+| Conflict, rate-limit, permission, network errors, safe retry | **Shipped + tested** | `ghErrorOf()` codes; stale base detected before writing; writes never auto-retried; ref never forced |
+| Local history: compare, diff, restore, design ⇄ run ⇄ commit | **Shipped** | History tab; revisions link the layer that produced them and the commit URL from the run |
+| Repo URL validation, path traversal, secret hygiene | **Shipped + tested** | `GH_PATH_RE`, `GH_REPO_RE`, `GH_BRANCH_RE` in the adapter, `ghScrub()` on every message, privacy test pins one `fetch(` call site |
+| Multi-project workspace, destructive warnings, isolation | **Shipped** | Overview tab: create/rename/duplicate/archive/delete (two-press confirm), search/sort/recents, per-project files and revisions |
+| Tabs, sub-tabs, progressive disclosure, states, tooltips | **Shipped** | eight tabs; 8 → all assets; per-tab empty states; disabled controls while a run is in flight; `title`/`aria-label` on icon-only buttons |
+| Pagination / virtualisation | **Partial** | assets are windowed at 8 rows and files at 12 thumbnails; the full list renders on request. A true virtual list is not needed at Figma's panel size |
+| Keyboard, a11y, responsive | **Shipped** | `role="tablist"`, roving tabindex, arrow/Home/End, focus restoration, 480 px layout |
+| Testing: unit, integration, UI, GitHub, SVG fidelity, security, cancellation | **Shipped** | `tests/platform.js` + extended `tests/unit-ui.js`; the browser sandbox test is unchanged |
+
+**Architecture-compatibility notes**
+
+- A Figma plugin cannot implement the OAuth web flow (no redirect URL, no place to keep a
+  client secret). A fine-grained PAT stored in `clientStorage` is the smallest correct
+  option; the plugin thread is the only code that ever sees it.
+- Figma's plugin sandbox is single-threaded and cannot spawn workers, so "concurrency"
+  here means a bounded, cancellable sequence rather than parallel execution.
+- Illustration classification is a heuristic over exported geometry; Figma exposes no
+  semantic "this is artwork" flag. `svgFrames` therefore has three levels, and the panel
+  states which signal fired.
+- `clientStorage` is per machine and per plugin instance: projects and revisions do not
+  sync across devices, which is why the README calls the workspace local.

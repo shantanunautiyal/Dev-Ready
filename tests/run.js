@@ -110,16 +110,31 @@ async function privacyAndOffline() {
     const e = q('Abril Fatface', ['1,400']); if (e.ok[0] !== '0,400') errs.push('missing italic should fall back to upright');
     record('privacy', 'bundled Google Fonts catalog: weights, italics, variable ranges, fallbacks', errs, eng.run('GF_DATA.split(";").length') + ' families');
   }
-  // 3) Static: no network APIs in code.js; manifest limited to Google Fonts
+  // 3) Static: one deliberate network path, one allowlist, no token leaks
   {
     const errs = [];
-    if (/\bfetch\s*\(/.test(CODE)) errs.push('code.js calls fetch()');
-    if (/XMLHttpRequest|WebSocket|sendBeacon|EventSource/.test(CODE)) errs.push('other network API used in code.js');
+    // Exactly one call site, and it targets the GitHub API constant.
+    const calls = CODE.match(/\bfetch\s*\(/g) || [];
+    if (calls.length !== 1) errs.push('expected exactly one fetch() call site, found ' + calls.length);
+    if (!/fetch\(GH_API \+ path/.test(CODE)) errs.push('the only fetch() must go through GH_API in ghRequest()');
+    if (/XMLHttpRequest|WebSocket|sendBeacon|EventSource/.test(CODE)) errs.push('another network API is used in code.js');
+    if (!/function ghScrub/.test(CODE)) errs.push('no token scrubbing for error text');
+    if (/post\(\{[^}]*\btoken\s*:/.test(CODE)) errs.push('the token is included in a panel message');
+    if (/msg\.token[^;]{0,40}post\(/.test(CODE)) errs.push('the token is echoed back to the panel');
+    if (/Authorization/.test(CODE) && !/Authorization': 'Bearer ' \+ token/.test(CODE)) errs.push('an unexpected Authorization header');
+    // Requests only happen inside the adapter, which every handler reaches after an
+    // explicit message — check the message list rather than hoping.
+    ['gh-status', 'gh-repos', 'gh-branches', 'gh-create-repo', 'gh-tree', 'gh-commit', 'gh-connect', 'gh-disconnect']
+      .forEach(t => { if (CODE.indexOf("'" + t + "'") < 0) errs.push('missing GitHub message ' + t); });
     const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'devready-plugin', 'manifest.json'), 'utf8'));
     const allowed = (manifest.networkAccess && manifest.networkAccess.allowedDomains) || [];
-    allowed.forEach(d => { if (!/fonts\.(googleapis|gstatic)\.com/.test(d)) errs.push('manifest allows ' + d); });
-    if (/no data is sent/i.test(manifest.networkAccess.reasoning || '')) errs.push('manifest reasoning claims "no data is sent"');
-    record('privacy', 'no network APIs in code.js; manifest allows only Google Fonts, with accurate reasoning', errs, 'allowedDomains: ' + allowed.join(', '));
+    const expected = ['https://fonts.googleapis.com', 'https://fonts.gstatic.com', 'https://api.github.com'];
+    if (allowed.slice().sort().join(',') !== expected.slice().sort().join(',')) errs.push('allowlist is ' + allowed.join(', '));
+    allowed.forEach(d => { if (/[*]/.test(d)) errs.push('wildcard domain allowed: ' + d); });
+    const why = manifest.networkAccess.reasoning || '';
+    if (/no data is sent/i.test(why)) errs.push('manifest reasoning claims "no data is sent"');
+    if (!/api\.github\.com/.test(why) || !/token/i.test(why)) errs.push('reasoning does not describe the GitHub path or the token');
+    record('privacy', 'one deliberate network path (GitHub, user-initiated), a fixed allowlist and no token leaks', errs, 'allowedDomains: ' + allowed.join(', '));
   }
 }
 
@@ -749,7 +764,7 @@ function sandboxCheck() {
   console.log('DevReady test suite');
   sandboxCheck();
   for (const fx of FIXTURES) if (!only || fx.name.includes(only)) await runFixture(fx);
-  if (!only) { await changeTracking(); await privacyAndOffline(); await messageValidation(); await require('./features')(record); await require('./improvements')(record); await require('./enhancements')(record); await require('./unit-ui')(record); await codegenQuality(); await codegenFollowup(); await typescriptTargets(); await goldenOutput(); await generatedProjectBuild(); repoLayout(); docConsistency(); }
+  if (!only) { await changeTracking(); await privacyAndOffline(); await messageValidation(); await require('./features')(record); await require('./improvements')(record); await require('./enhancements')(record); await require('./unit-ui')(record); await require('./platform')(record); await codegenQuality(); await codegenFollowup(); await typescriptTargets(); await goldenOutput(); await generatedProjectBuild(); repoLayout(); docConsistency(); }
   const total = results.length;
   console.log('\n' + (failed ? C.r(failed + ' failed') : C.g('all passed')) + ' · ' + (total - failed) + '/' + total + ' checks');
   if (REPORT) {
