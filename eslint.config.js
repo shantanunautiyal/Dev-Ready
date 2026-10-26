@@ -2,7 +2,10 @@
 const js = require('@eslint/js');
 const globals = require('globals');
 
-const figmaGlobals = { figma: 'readonly', __html__: 'readonly', __uiFiles__: 'readonly', console: 'readonly', setTimeout: 'readonly', clearTimeout: 'readonly', setInterval: 'readonly', clearInterval: 'readonly', TextEncoder: 'readonly', TextDecoder: 'readonly', Uint8Array: 'readonly' };
+// The plugin main thread has no DOM, but Figma does provide `fetch` (limited to the
+// manifest's allowedDomains) and `URL`. Both are declared here so an accidental
+// network call is still visible in review: code.js only reaches fetch in ghRequest.
+const figmaGlobals = { figma: 'readonly', __html__: 'readonly', __uiFiles__: 'readonly', console: 'readonly', setTimeout: 'readonly', clearTimeout: 'readonly', setInterval: 'readonly', clearInterval: 'readonly', TextEncoder: 'readonly', TextDecoder: 'readonly', Uint8Array: 'readonly', fetch: 'readonly', URL: 'readonly' };
 
 const rules = {
   ...js.configs.recommended.rules,

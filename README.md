@@ -9,7 +9,7 @@ Inspect specs like Dev Mode, generate real code in 12 targets, see what changed 
   <a href=".github/workflows/ci.yml"><img src="https://github.com/Ankushui18/Dev-Ready/actions/workflows/ci.yml/badge.svg" alt="Tests"></a>
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT">
   <img src="https://img.shields.io/badge/Figma-Design%20%2B%20Dev%20Mode-0d99ff" alt="Figma Design + Dev Mode">
-  <img src="https://img.shields.io/badge/tests-158%20passing-brightgreen" alt="158 checks passing">
+  <img src="https://img.shields.io/badge/tests-221%20passing-brightgreen" alt="221 checks passing">
 </p>
 
 ---
@@ -26,10 +26,11 @@ DevReady is a **Figma plugin**, not a website. Pick the path that matches you:
 | **Understand or change the code** | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — map of `code.js` and `ui.html` |
 | **Run the tests / contribute** | [CONTRIBUTING.md](CONTRIBUTING.md) · [Quality](#quality) |
 | **See what's missing** (honest list) | [Known limits](#known-limits) |
+| **Plan the next release** | [docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md) — findings, features, edge cases, test plan |
 | **Publish it to Figma Community** | [docs/LAUNCH.md](docs/LAUNCH.md) |
 | **Fix the repo if files were uploaded to the wrong place** | [docs/GITHUB_SETUP.md](docs/GITHUB_SETUP.md) |
 
-> **Status: v1.2.0, local development plugin.** It is not on Figma Community yet, so you install it from this repo (below). Everything runs inside Figma — no account, no server, no tracking.
+> **Status: v1.5.1, local development plugin.** It is not on Figma Community yet, so you install it from this repo (below). Everything runs inside Figma — no account, no server, no tracking.
 
 ---
 
@@ -49,11 +50,14 @@ Figma's **Dev Mode** shows developers the specs of a design: sizes, spacing, col
 | **Code (12 targets)** | **React + TypeScript**, React + TypeScript + Tailwind, React + Tailwind, React + CSS, HTML + CSS, single-file HTML, Vue, Svelte, React Native, SwiftUI, Jetpack Compose, Flutter. Semantic tags, BEM classes, design tokens, real components for repeated instances — with **typed props** and ambient asset declarations in the TypeScript targets — and a project ZIP with `fonts/` + `assets/`. |
 | **Preview & compare** | Renders the generated HTML next to, or on top of, the Figma design. Difference blend mode makes mismatches visible. |
 | **Change tracking** | Lists layers that changed since handoff — size/position, style, text, name, added and removed — with **before → after** values. |
-| **Accessibility** | WCAG 2.2 contrast for every text layer, touch-target sizes, unlabelled icon buttons, text under 12px. Click a row to select the layer. |
+| **Accessibility** | WCAG 2.2 AA: text contrast, non-text contrast for icons and outlines (3:1), alt-text checks, heading order, field labels, touch-target sizes, unlabelled icon buttons, text under 12px. Click a row to select the layer, ignore it with a reason (stored in the file), or export a Markdown/CSV report. |
 | **Design tokens** | Export this layer or the whole file as CSS variables, SCSS, JSON (design-tokens format) or a Tailwind v4 `@theme`, with every variable mode. |
 | **Annotations** | Figma-native annotations with categories and pinned properties, plus a canvas-note fallback that works on every plan. |
 | **Assets & export** | Icons and images found automatically. PNG/JPG/SVG/PDF at 0.5–4x, or everything as one ZIP. |
 | **Free-plan friendly** | Where Figma's native *Ready for dev* status isn't available (free plans, Dev Mode), DevReady uses its own flag and always labels which one it used. |
+| **Workspace** | A tabbed panel: Overview, Design, **Design Files**, **Code**, Assets, History, GitHub, Settings. Projects hold several design entries, each with its own status, output and revision history. Generated files are listed per run and downloadable one by one or as a ZIP. |
+| **Vector illustrations** | A self-contained illustration frame (logo, spot art, decorative vector) is exported as **one SVG asset** — viewBox, fills, strokes, gradients, masks and clip paths intact — and referenced as an image, instead of being exploded into dozens of divs. Real UI frames, forms, buttons and nav are still generated as code. |
+| **GitHub (optional)** | Connect with a fine-grained token, pick or create a repository, preview added/modified/deleted files, choose what to include, then commit. Conflicts, rate limits, permissions and network loss each get their own explanation. Off unless you connect it. [Setup, permissions, limits →](docs/PUBLISHING.md) |
 
 <p align="center">
   <img src="docs/screenshots/inspect.png" width="30%" alt="Inspect panel with status, overrides, dev resources and changes">
@@ -141,11 +145,14 @@ Dev-Ready/
 │   ├── FAQ.md                 free plan, Dev Mode, fonts, exports, common confusions
 │   ├── LAUNCH.md              Figma Community checklist + manual test matrix
 │   ├── GITHUB_SETUP.md        repo settings, upload mistakes, releases
+│   ├── PUBLISHING.md          in-plugin GitHub publishing: token, permissions, limits, errors
 │   ├── NAMING.md              name options and what to rename if you pick one
+│   ├── IMPROVEMENTS.md        review: findings, feature roadmap, edge cases, test plan
 │   ├── test-report.md         latest test results
 │   ├── screenshots/           images used above
 │   └── brand/                 icon, cover, social preview
-├── tests/                     fixtures × 12 targets, privacy, change tracking, browser sandbox
+├── tests/                     fixtures × 12 targets, privacy, change tracking, the workspace
+│                              (platform.js), panel units (unit-ui.js), browser sandbox
 ├── scripts/                   layout check, lint, ZIP builder
 ├── .github/workflows/ci.yml   what runs on every push and tag
 ├── CHANGELOG.md               what changed in each version
@@ -157,13 +164,82 @@ Dev-Ready/
 
 ---
 
+## Workspace, illustrations and GitHub
+
+### Tabs
+
+The panel opens on **Design** (the original inspector, unchanged). The tab bar
+adds six more surfaces:
+
+| Tab | What it is for |
+|---|---|
+| **Overview** | Current selection, layer count, depth, cost estimate, warnings, recent activity, and the project list with search, sort (recent / name / created) and archived projects. |
+| **Design** | The inspector: specs, tokens, code for 12 targets, preview, changes, accessibility (seven WCAG criteria, ignore-with-a-reason stored in the file, Markdown/CSV report). |
+| **Design Files** | The design entries of the active project. **Generate all** runs them one at a time with a progress meter; each file keeps its own status and error, and **Retry N failed** re-runs only the failures. **Cancel** stops the queue. |
+| **Code** | The files from the last successful run: name, size, per-file download, ZIP download, and shortcuts to history and publishing. |
+| **Assets** | Every icon, image and illustration on the layer. Search, filter by type, expand from 8 rows to all of them (*Show all* / *Show less*), export one or all. |
+| **History** | Local revisions with compare (added / removed / changed / unchanged, line diff) and restore. |
+| **GitHub** | Connect, list and create repositories, pick a branch, preview the diff of what will change, choose files, commit. |
+| **Settings** | Units, rem base, colour format, gate, font previews, **vector illustrations**, limits, and clearing local data. |
+
+Selections, scroll position and the open section survive a tab switch; a run in
+progress keeps running while you look at another tab.
+
+### Vector illustrations and UI frames
+
+A frame is treated as one illustration when it is a self-contained vector group
+with no text, no instances and no raster content, and it either
+
+1. is named like artwork (`illustration`, `logo`, `artwork`, `spot`, `glyph`, …), or
+2. has its own SVG export setting, or
+3. is complex enough to be artwork rather than a component (many vectors, square-ish, no UI naming).
+
+| `svgFrames` setting | Behaviour |
+|---|---|
+| `auto` (default) | All three signals above. |
+| `named` | Only an explicit name or SVG export setting — useful when a file names things loosely. |
+| `off` | The previous behaviour: every vector becomes an element. |
+
+The exported SVG keeps its `viewBox` and is sanitised (`cleanSvg`): scripts,
+event handlers, external references, remote `url()` and `@import` are rejected,
+while local `<use href="#id">` and `url(#gradient)` are kept. If the export fails
+or the SVG is malformed, the frame **falls back to normal element output** with a
+note in the panel — never silently to an empty image. Oversized artwork is
+reported in the asset list instead of being retried in a loop, and a missing font
+inside an outline-only illustration cannot occur (text frames are never treated
+as artwork).
+
+### Cost, limits and cancellation
+
+Before anything is generated, `assessComplexity()` walks the selection (bounded
+at 6,000 layers) and reports layers, depth, text, vectors, instances, images and
+a millisecond estimate, with warnings when a run will be truncated. The limits
+are fixed and documented in the panel under **Settings → Limits**:
+
+| Limit | Value |
+|---|---|
+| Layers described per selection | 6,000 |
+| Layers per generation | 2,500 (truncated beyond, and said so) |
+| Asset walk | 2,000 layers, 400 assets |
+| Generation timeout in the panel | 20 s |
+| Local storage per key | 200 kB |
+| Projects / revisions kept | 20 projects, 8 revisions |
+
+A run carries a job id. **Cancel** marks it and the engine stops at the next
+layer boundary, returns an empty result marked `cancelled`, and the queue moves
+on. Starting the same file twice is refused while it is running, so two runs
+cannot fight over the same layer.
+
+---
+
 ## Quality
 
 ```bash
 npm ci
 npm run verify        # layout + Figma sandbox check + ESLint + tests (what CI runs)
-npm test              # 158 checks: 9 fixtures × 12 targets, privacy, messages, tracking,
-                      # tsc, golden output, and a real bundle of the generated React project
+npm test              # 221 checks: 9 fixtures × 12 targets, privacy, messages, tracking,
+                      # tsc, golden output, a real bundle of the generated React project,
+                      # the tabbed workspace and the GitHub adapter (all offline)
 npm test -- --update-golden   # accept a deliberate change to generated output
 npm run lint          # ESLint, including the script inside ui.html
 npm run test:browser  # Chromium: renders the panel, attacks the preview sandbox (needs Python Playwright)
@@ -178,7 +254,7 @@ Every push runs [CI](.github/workflows/ci.yml):
 - **The published counts can't drift:** a check compares the README badge and `docs/test-report.md` against the number of checks the suite actually ran.
 - **Hostile layer names** can't inject markup or break string literals, and design text can't reach `{{ }}`, `{ }` or `$` interpolation.
 - **Every UI → plugin message** is validated against a schema (15 attack cases), and crafted component mappings can't inject code.
-- **Privacy:** no network APIs in `code.js`, private font names never appear in a Google URL, and only Google Fonts are allowed by the manifest.
+- **Privacy:** `code.js` has exactly one `fetch(` call site (inside the GitHub adapter), private font names never appear in a Google URL, the manifest's allowlist is exactly two Google Fonts hosts plus `api.github.com`, and a token can never reach a panel message.
 - **Change tracking** stays under Figma's 100 kB plugin-data limit, and before → after values are correct.
 - **The preview iframe is sandboxed** — a hostile document can't run scripts, reach other hosts or touch the panel (checked in a real browser).
 - **Repository layout** is correct, so a mis-placed upload fails the build.
@@ -193,7 +269,11 @@ Honest list — these are APIs Figma doesn't give plugins, not things we haven't
 
 - **This is not Dev Mode.** Hover-to-measure on canvas, version comparison, change notifications and VS Code's built-in Figma integration are Figma features; plugins can't reproduce them.
 - **Code** stops after a layer budget: 600 in the panel, 1,500 for project downloads, 150 in Dev Mode's Code section (Figma gives codegen a 3-second budget). The output says when it truncated; pick a smaller frame for the full tree.
-- **Change tracking** shows before → after for position, size, fills, strokes, radius, effects, layout/padding, font and text (first 80 characters). Gradients stops and individual effect parameters are flagged by category only. It covers the first 2,500 layers of a frame.
+- **Change tracking** shows before → after for position, size, fills, strokes, radius, effects, layout/padding, font and text (first 80 characters). Gradients stops and individual effect parameters are flagged by category only. It covers the first 2,500 layers of a frame, or 400,000 characters of snapshot data, whichever comes first — past that the snapshot marks itself partial rather than claiming "no changes".
+- **Illustration detection is a heuristic.** It uses names, export settings and vector density. A hand-drawn vector that looks like UI can still be exported as one SVG (switch to `named`), and a loosely named illustration may still be generated as elements (rename it, or add an SVG export setting).
+- **GitHub publishing needs a fine-grained token** with *Contents: read and write* (plus *Administration: write* to create repositories). Figma plugins have no OAuth redirect, so the token is pasted in and kept in `clientStorage`; see [docs/PUBLISHING.md](docs/PUBLISHING.md) for the full contract and the error table.
+- **The accessibility audit is a static analysis.** Text and non-text contrast, alt-text hints, heading order, field labels and target sizes come from the layers themselves. Colour-only meaning, focus-ring visibility, motion, text spacing and reflow only exist in a rendered, used interface, so the audit names them as out of scope instead of guessing. Alt text is inferred from layer names and marked *inferred* in the report; an "ignored" decision needs write access, so it is unavailable in Dev Mode (the audit still runs).
+- **Local history is local.** Projects and revisions live in `clientStorage` (200 kB per key, 20 projects, 8 revisions). They are not synced between machines and do not survive uninstalling the plugin.
 - **SwiftUI, Compose, Flutter and React Native output** is checked for structure and safe escaping, but not compiled in CI. JSX and CSS are parsed by esbuild. Native text with Figma Auto line-height uses the platform font engine's metrics; SVG baseline measurements are applied only to web CSS, where they have a direct meaning.
 - **Native annotations and native *Ready for dev*** depend on your Figma plan and seat; DevReady falls back to canvas notes and its own flag, and the UI says which one is in use.
 - **Partially tested on a real Figma file** (20 Oct 2026, Design mode, dark theme): the panel, the gate and its status source, inspect data, variables, assets, and full-tree HTML + CSS on a 214-layer frame all worked. **Dev Mode (Inspect → Plugins, the Code section) and Figma for VS Code have not been run yet**, and neither has the light theme. [docs/LAUNCH.md](docs/LAUNCH.md#3-environment-test-matrix) has the row-by-row result and the screenshots, including the rows that failed.

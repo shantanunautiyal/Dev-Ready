@@ -12,13 +12,41 @@
 
 const NS = 'devready'; // shared plugin data namespace
 const IS_DEV = figma.editorType === 'dev';
+/* Figma APIs come and go with plan, editor mode and file age: a call that fails
+   used to be swallowed by an empty catch, so the panel quietly showed fewer
+   tokens / fonts / mappings with no explanation. Every degraded call now leaves
+   a short note behind, which the panel lists as "limited data". Bounded and
+   de-duplicated so a hot loop cannot flood it. */
+const DIAGS = [];
+const DIAG_LIMIT = 12;
+function diag(where, err) {
+  if (DIAGS.length >= DIAG_LIMIT) return;
+  const msg = String(where || 'unknown step');
+  if (DIAGS.some(d => d.where === msg)) return;
+  const detail = err && err.message ? String(err.message) : err ? String(err) : '';
+  DIAGS.push({ where: msg, detail: detail.slice(0, 160) });
+}
+function clearDiagnostics() { DIAGS.length = 0; }
+function takeDiagnostics() { return DIAGS.slice(0); }
+/* Hidden instance children can't be selected or inspected, so skipping them saves
+   API calls on instance-heavy files. Guarded for Figma versions without the flag. */
+try { figma.skipInvisibleInstanceChildren = true; } catch (e) { /* older Figma */ }
+/* A deeply nested layer tree (Sketch/Illustrator/AI-generated layer soup) can be
+   thousands of levels deep. Every traversal in this file is recursive, so the
+   limit is enforced once and reported to the user instead of overflowing the stack. */
+const MAX_DEPTH = 120;
 const DEFAULT_SETTINGS = {
   gate: 'strict',        // 'strict' = only dev-ready designs, 'off' = always inspect
   unit: 'px',            // 'px' | 'rem'
   remBase: 16,
   colorFormat: 'hex',    // 'hex' | 'rgb' | 'hsl'
   pluginFlag: true,      // also accept the plugin's own "ready" flag (for free plans / Dev Mode)
-  previewFonts: 'google' // 'google' = preview loads public Google Fonts, 'off' = no network at all
+  previewFonts: 'google', // 'google' = preview loads public Google Fonts, 'off' = no network at all
+  // Vector illustrations become one SVG asset instead of a tree of divs.
+  // 'auto'  = illustrations by name, explicit SVG export or sheer vector complexity
+  // 'named' = only frames whose name says so, or that export as SVG
+  // 'off'   = every frame is converted element by element (previous behaviour)
+  svgFrames: 'auto'
 };
 let settings = Object.assign({}, DEFAULT_SETTINGS);
 
@@ -29,6 +57,9 @@ let settings = Object.assign({}, DEFAULT_SETTINGS);
 /* range-checked. The UI is bundled, but this keeps the boundary narrow. */
 /* ------------------------------------------------------------------ */
 const LANG_IDS = ['react-tailwind', 'react-css', 'react-ts', 'react-tailwind-ts', 'html-css', 'html-single', 'vue', 'svelte', 'react-native', 'swiftui', 'compose', 'flutter'];
+/* One table for "file extension → Dev Mode code language". It used to live inline in
+   the codegen handler, where a new target could be added and forgotten. */
+const CODEGEN_LANG = { html: 'HTML', vue: 'HTML', svelte: 'HTML', css: 'CSS', jsx: 'JAVASCRIPT', tsx: 'TYPESCRIPT', ts: 'TYPESCRIPT', swift: 'SWIFT', kotlin: 'KOTLIN', dart: 'PLAINTEXT', text: 'PLAINTEXT' };
 const MAP_NAME_RE = /^[A-Za-z_$][\w$.]{0,79}$/;
 const MAP_PATH_RE = /^[\w@~.\-][\w@~.\/\-]{0,199}$/;
 const V = {
@@ -44,15 +75,24 @@ const V = {
   opt: f => v => v === undefined || v === null || v === '' ? '' : f(v)
 };
 const EXPORT_ITEM = { id: V.id, format: V.oneOf(['PNG', 'JPG', 'SVG', 'PDF']), scale: V.num(0.5, 4) };
-const SETTINGS_SCHEMA = { gate: V.oneOf(['strict', 'off']), unit: V.oneOf(['px', 'rem']), remBase: V.int(8, 32), colorFormat: V.oneOf(['hex', 'rgb', 'hsl']), pluginFlag: V.bool, previewFonts: V.oneOf(['google', 'off']) };
+const SETTINGS_SCHEMA = { gate: V.oneOf(['strict', 'off']), unit: V.oneOf(['px', 'rem']), remBase: V.int(8, 32), colorFormat: V.oneOf(['hex', 'rgb', 'hsl']), pluginFlag: V.bool, previewFonts: V.oneOf(['google', 'off']), svgFrames: V.oneOf(['auto', 'named', 'off']) };
+/* GitHub identifiers. Validated before any request is built, so a hostile
+   payload cannot redirect the adapter at another host or path. */
+const GH_NAME_RE = /^[A-Za-z0-9._-]{1,100}$/;
+const GH_REPO_RE = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+const GH_BRANCH_RE = /^[A-Za-z0-9._\/-]{1,200}$/;
+/* Never absolute, never a parent segment, no control characters, no .git trickery. */
+const GH_PATH_RE = /^(?!\/)(?!.*(?:^|\/)\.\.?(?:\/|$))(?!.*\.git(?:\/|$))[A-Za-z0-9._@+ -]{1,120}(?:\/[A-Za-z0-9._@+ -]{1,120})*$/;
+const GH_MAX_FILES = 200;
+const GH_MAX_BYTES = 4 * 1024 * 1024;
 const MSG_SCHEMA = {
   'ui-ready': {}, 'measure-native': {}, 'measure-clear': {}, 'notes-clear': {}, 'redlines': {}, 'clear-redlines': {},
   'settings': { settings: v => { if (!v || typeof v !== 'object') return undefined; const o = {}; Object.keys(SETTINGS_SCHEMA).forEach(k => { if (k in v) { const x = SETTINGS_SCHEMA[k](v[k]); if (x !== undefined) o[k] = x; } }); return o; } },
-  'select': { id: V.id }, 'goto': { id: V.id }, 'design-shot': { id: V.id }, 'baseline-save': { id: V.id }, 'baseline-clear': { id: V.id },
+  'select': { id: V.id }, 'goto': { id: V.id }, 'design-shot': { id: V.id }, 'thumb-request': { id: V.id }, 'baseline-save': { id: V.id }, 'baseline-clear': { id: V.id },
   'mark': { id: V.id, status: V.opt(V.oneOf(['READY_FOR_DEV', 'COMPLETED'])), note: V.str(2000) },
   'export': EXPORT_ITEM,
   'export-all': { items: v => Array.isArray(v) ? v.slice(0, 300).map(i => checkFields(i || {}, EXPORT_ITEM)).filter(Boolean) : undefined, zipName: V.opt(V.re(/^[\w .\-]{1,100}\.zip$/, 104)) },
-  'gen-code': { lang: V.oneOf(LANG_IDS), requestId: V.opt(V.int(1, Number.MAX_SAFE_INTEGER)), nodeId: V.opt(V.id) }, 'tokens-export': { format: V.oneOf(['css', 'scss', 'json', 'tailwind']), scope: V.oneOf(['selection', 'file']) }, 'export-project': { lang: V.oneOf(LANG_IDS) },
+  'gen-code': { lang: V.oneOf(LANG_IDS), requestId: V.opt(V.int(1, Number.MAX_SAFE_INTEGER)), nodeId: V.opt(V.id), jobId: V.opt(V.int(1, Number.MAX_SAFE_INTEGER)) }, 'tokens-export': { format: V.oneOf(['css', 'scss', 'json', 'tailwind']), scope: V.oneOf(['selection', 'file']) }, 'export-project': { lang: V.oneOf(LANG_IDS) },
   'font-upload': { family: V.re(/^[^|]{1,100}$/, 100), key: V.re(/^[01],[1-9]00$/, 5), ext: V.oneOf(['woff2', 'woff', 'ttf', 'otf']), bytes: V.bytes(2.5 * 1024 * 1024), name: V.str(200), last: V.bool },
   'font-remove': { family: V.re(/^[^|]{1,100}$/, 100), key: V.re(/^[01],[1-9]00$/, 5) },
   'annotate-add': { id: V.id, label: V.str(5000), prop: V.opt(V.re(/^[A-Za-z]{1,40}$/, 40)), cat: V.opt(V.re(/^[\w:;\-]{1,200}$/, 200)), color: V.opt(V.oneOf(['yellow', 'orange', 'red', 'pink', 'violet', 'blue', 'teal', 'green'])), pin: V.bool },
@@ -61,7 +101,55 @@ const MSG_SCHEMA = {
   'map-save': { key: V.re(/^[\w:;\-]{1,200}$/, 200), name: V.re(MAP_NAME_RE, 80), path: V.opt(V.re(MAP_PATH_RE, 200)) },
   'map-remove': { key: V.re(/^[\w:;\-]{1,200}$/, 200) },
   'notify': { text: V.str(300), error: V.bool },
-  'resize': { w: V.num(360, 1600), h: V.num(420, 1600) }
+  'resize': { w: V.num(360, 1600), h: V.num(420, 1600) },
+  /* Long jobs can be cancelled. The id is chosen by the panel so a stale cancel
+     can never stop a newer run. */
+  'cancel': { jobId: V.int(1, Number.MAX_SAFE_INTEGER) },
+  /* Per-layer plan: is it an illustration, how expensive is it, can it be generated. */
+  'plan': {},
+  /* Accessibility review decisions and reporting. */
+  'a11y-ignore': { ids: v => Array.isArray(v) ? v.filter(x => typeof x === 'string' && x.length < 80).slice(0, 50) : undefined, reason: V.opt(V.str(120)) },
+  'a11y-unignore': { ids: v => Array.isArray(v) ? v.filter(x => typeof x === 'string' && x.length < 80).slice(0, 50) : undefined },
+  'a11y-report': { format: V.oneOf(['md', 'csv']) },
+  /* Workspace state (projects, local revisions) lives in clientStorage, never in
+     the document. Only these keys are readable, and only as bounded JSON. */
+  'store-get': { key: V.oneOf(['projects', 'history']) },
+  'store-set': { key: V.oneOf(['projects', 'history']), value: V.re(/^[\s\S]{2,600000}$/, 600000) },
+  /* GitHub — optional, token-based, every call user-initiated. */
+  'gh-status': {}, 'gh-disconnect': {},
+  'gh-connect': { token: V.re(/^\S{20,255}$/, 255) },
+  'gh-repos': {},
+  'gh-branches': { repo: V.re(/^\S{1,300}$/, 300) },
+  'gh-tree': {
+    repo: V.re(/^\S{1,300}$/, 300),
+    branch: V.opt(V.re(/^\S{0,200}$/, 200)),
+    // The panel sends the files it would push so the preview can compare hashes.
+    files: v => {
+      if (!Array.isArray(v) || v.length > GH_MAX_FILES) return undefined;
+      return v.slice(0, GH_MAX_FILES).map(f => ({
+        path: f && typeof f.path === 'string' ? f.path.slice(0, 300) : '',
+        content: f && typeof f.content === 'string' ? f.content.slice(0, GH_MAX_BYTES) : ''
+      }));
+    }
+  },
+  'gh-create-repo': { name: V.re(GH_NAME_RE, 100), private: V.bool, description: V.str(200) },
+  'gh-commit': {
+    // Shape only: paths, counts, sizes and refs are validated by ghCommit(), which
+    // answers with an error code instead of leaving the panel waiting.
+    repo: V.re(/^\S{1,300}$/, 300),
+    branch: V.re(/^\S{1,200}$/, 200),
+    message: V.re(/^[^\u0000-\u0008]{0,500}$/, 500),
+    baseSha: V.opt(V.re(/^[^\s]{0,40}$/, 40)),
+    createBranch: V.bool,
+    files: v => {
+      if (!Array.isArray(v) || v.length > 500) return undefined;
+      return v.slice(0, 500).map(f => ({
+        path: f && typeof f.path === 'string' ? f.path.slice(0, 300) : '',
+        content: f && typeof f.content === 'string' ? f.content : '',
+        del: !!(f && f.del)
+      }));
+    }
+  }
 };
 /** Returns a cleaned copy with only schema fields, or null if a required field is invalid. */
 function checkFields(src, schema, bad) {
@@ -170,53 +258,100 @@ function markTarget(node) {
   }
   return null;
 }
+/**
+ * Where the DevReady flag goes when Figma's own status isn't available.
+ * Shared plugin data works on every node type and every plan, so the same
+ * container rule applies — but without the MARKABLE restriction. Without this,
+ * a design built from top-level groups could never be marked, and the gate
+ * would stay locked for the whole file.
+ */
+function flagTarget(node) {
+  let n = node;
+  while (n && n.parent) {
+    const pt = n.parent.type;
+    if (pt === 'PAGE' || pt === 'SECTION') return n.type === 'PAGE' || n.type === 'DOCUMENT' ? null : n;
+    n = n.parent;
+  }
+  return n && n.type !== 'PAGE' && n.type !== 'DOCUMENT' ? n : null;
+}
+
+/** The layer that a status would be written to, and whether Figma can hold it natively. */
+function statusTargets(node) {
+  const native = markTarget(node);
+  const flag = native || flagTarget(node);
+  return { native: native, flag: flag };
+}
 
 async function setReady(nodeId, type, note) {
   const node = await figma.getNodeByIdAsync(nodeId);
   if (!node) return { ok: false, error: 'Layer not found' };
-  const target = markTarget(node);
-  if (!target) return { ok: false, error: 'Select a frame, component or section that sits directly on the page or inside a section.' };
+  const t = statusTargets(node);
+  const target = t.flag;
+  if (!target) return { ok: false, error: 'Select a layer that sits on a page or inside a section.' };
+
+  // Keep the handoff note across routine status changes: clearing a status is
+  // explicit, and re-marking with an empty note must not erase the context.
+  let kept = '';
+  if (type) {
+    const own = ownStatus(target);
+    kept = (note && String(note).trim()) ? String(note) : (own ? own.description || '' : '');
+  }
 
   let native = false;
-  if (!IS_DEV) {
+  if (!IS_DEV && t.native) {
     try {
       if (type) {
         const ds = { type: type };
-        if (note) ds.description = note;
-        target.devStatus = ds;
+        if (kept) ds.description = kept;
+        t.native.devStatus = ds;
       } else {
-        target.devStatus = null;
+        t.native.devStatus = null;
       }
       native = true;
     } catch (e) {
       native = false; // e.g. free plan, nested status, or restricted
     }
   }
-  // Plugin flag (works on any plan and in Dev Mode, since pluginData is writable there)
-  target.setSharedPluginData(NS, 'status', native ? '' : (type || ''));
-  target.setSharedPluginData(NS, 'note', native ? '' : (note || ''));
-  target.setSharedPluginData(NS, 'at', type && !native ? new Date().toISOString() : '');
+  // The flag is always mirrored, not only when the native write fails. Teams mix
+  // paid and free seats: a free-plan collaborator, a viewer or another plugin can
+  // only read shared plugin data, and would otherwise see a ready design as locked.
+  target.setSharedPluginData(NS, 'status', type || '');
+  target.setSharedPluginData(NS, 'note', type ? kept : '');
+  target.setSharedPluginData(NS, 'at', type ? new Date().toISOString() : '');
   try { target.setRelaunchData(type ? { open: 'Dev ready — inspect specs & code' } : {}); } catch (e) { /* ignore */ }
   // Change tracking: snapshot the design when it's handed off
   try {
     if (type === 'READY_FOR_DEV') saveBaseline(target);
     else if (!type) clearBaseline(target);
   } catch (e) { /* ignore */ }
-  return { ok: true, native: native, name: target.name };
+  return { ok: true, native: native, name: target.name, note: kept, source: native ? 'figma' : 'plugin' };
 }
 
-/** All designs with a status on the current page (top level + inside sections). */
-function listReady() {
+/**
+ * All designs with a status (top level + nested sections).
+ * scope: 'page' (default, fast) | 'file' (every page, for the handoff inbox).
+ */
+function listReady(scope) {
   const out = [];
-  function visit(parent, depth) {
-    if (!('children' in parent) || depth > 4) return;
+  let pages = [figma.currentPage];
+  if (scope === 'file') {
+    try { if (figma.root && figma.root.children && figma.root.children.length) pages = figma.root.children; } catch (e) { /* page-scoped only */ }
+  }
+  const seen = {};
+  const MAX_SECTION_DEPTH = 8;
+  function visit(parent, depth, pageName) {
+    if (!('children' in parent) || depth > MAX_SECTION_DEPTH) return;
     for (const n of parent.children) {
       const s = ownStatus(n);
-      if (s) out.push({ id: n.id, name: n.name, type: n.type, status: s.type, note: s.description, source: s.source });
-      if (n.type === 'SECTION') visit(n, depth + 1);
+      if (s) out.push({ id: n.id, name: n.name, type: n.type, status: s.type, note: s.description, source: s.source, page: pageName });
+      if (n.type === 'SECTION') visit(n, depth + 1, pageName);
     }
   }
-  visit(figma.currentPage, 0);
+  pages.forEach(p => {
+    if (!p || p.type !== 'PAGE' || seen[p.id]) return;
+    seen[p.id] = 1;
+    visit(p, 0, p.name);
+  });
   return out;
 }
 
@@ -258,6 +393,16 @@ async function styleName(id) {
   } catch (e) { /* ignore */ }
   styleCache[id] = name;
   return name;
+}
+/**
+ * Variables, styles and collections can be renamed or edited while the plugin is
+ * open. Without dropping these caches the panel keeps showing the old name (or a
+ * stale "not found") for the rest of the session. Called on every document change;
+ * diffCache is part of the same invalidation.
+ */
+function clearLookupCaches() {
+  [varCache, styleCache, collCache].forEach(cache => { Object.keys(cache).forEach(k => { delete cache[k]; }); });
+  Object.keys(diffCache).forEach(k => { diffCache[k] = null; });
 }
 
 /* ------------------------------------------------------------------ */
@@ -742,24 +887,29 @@ function cssToTailwind(css, unit, base) {
 /* Asset detection                                                     */
 /* ------------------------------------------------------------------ */
 const VECTORISH = { VECTOR: 1, BOOLEAN_OPERATION: 1, STAR: 1, LINE: 1, ELLIPSE: 1, POLYGON: 1, RECTANGLE: 1 };
-function allVector(n) {
+const ASSET_WALK_LIMIT = 2000;
+function allVector(n, depth, seen) {
   // Image-filled rectangles/ellipses are raster content, even though their node
   // type is vector-ish. Check every descendant so avatar stacks are not exported
-  // as one opaque SVG icon.
+  // as one opaque SVG icon. Bounded: a pathological tree must not overflow.
+  depth = depth || 0; seen = seen || { n: 0 };
+  if (depth > MAX_DEPTH || seen.n++ > ASSET_WALK_LIMIT) return false;
   if (n.visible === false || hasImageFill(n)) return false;
   if (!('children' in n)) return !!VECTORISH[n.type];
   if (n.type === 'BOOLEAN_OPERATION') return true;
   const kids = n.children.filter(c => c.visible !== false);
   if (!kids.length) return false;
-  for (const c of kids) { if (!allVector(c)) return false; }
+  for (const c of kids) { if (!allVector(c, depth + 1, seen)) return false; }
   return true;
 }
 function hasImageFill(n) {
   return 'fills' in n && !isMixed(n.fills) && n.fills.some(f => f.type === 'IMAGE' && f.visible !== false);
 }
-function hasNestedImageFill(n) {
+function hasNestedImageFill(n, depth, seen) {
+  depth = depth || 0; seen = seen || { n: 0 };
+  if (depth > MAX_DEPTH || seen.n++ > ASSET_WALK_LIMIT) return false;
   if (hasImageFill(n)) return true;
-  return 'children' in n && n.children.some(c => c.visible !== false && hasNestedImageFill(c));
+  return 'children' in n && n.children.some(c => c.visible !== false && hasNestedImageFill(c, depth + 1, seen));
 }
 function isIconLike(n) {
   // A vector-shaped container is still raster artwork when any visible paint or
@@ -772,21 +922,154 @@ function isIconLike(n) {
   }
   return false;
 }
-function collectAssets(root, limit) {
+/* ------------------------------------------------------------------ */
+/* Vector illustrations: one asset, not a hundred divs                 */
+/* A frame that is nothing but paths, shapes and boolean operations is  */
+/* artwork. Converting each inner path into markup produces hundreds of */
+/* unreachable nodes that never match the design pixel for pixel; the    */
+/* whole frame is exported as one SVG instead. Frames that contain text, */
+/* instances, components or raster paint stay UI and are converted.      */
+/* ------------------------------------------------------------------ */
+const ILLUSTRATION_HINT = /(illustration|artwork|vector|logo|mascot|drawing|graphic|diagram|hero.?art|sketch|painting|isometric)/i;
+/* A semantic UI name beats a coincidence: "Icon button", "Logo link" are UI. */
+const UI_NAME_HINT = /(button|btn|input|field|form|nav|menu|header|footer|toolbar|tab|card|modal|dialog|table|row|list|item|link|badge|chip|avatar|checkbox|radio|toggle|slider|tooltip|dropdown|select|search|pagination|breadcrumb|alert|banner|toast)/i;
+
+/** Bounded scan: what is actually inside this layer? */
+function vectorScan(node) {
+  const st = { nodes: 0, vectors: 0, maxDepth: 0, allVector: true, svgExport: false, text: 0, instances: 0, raster: 0 };
+  (function walk(n, depth) {
+    if (st.nodes > ASSET_WALK_LIMIT || depth > MAX_DEPTH) { st.allVector = false; return; }
+    if (n.visible === false) return;
+    st.nodes++;
+    st.maxDepth = Math.max(st.maxDepth, depth);
+    if (depth === 0) {
+      const es = 'exportSettings' in n ? n.exportSettings : [];
+      st.svgExport = es.some(e => e && String(e.format).toUpperCase() === 'SVG');
+    }
+    if (n.type === 'TEXT') st.text++;
+    else if (n.type === 'INSTANCE' || n.type === 'COMPONENT' || n.type === 'COMPONENT_SET') st.instances++;
+    if (hasImageFill(n)) st.raster++;
+    if (VECTORISH[n.type]) st.vectors++;
+    if (!('children' in n)) {
+      if (!VECTORISH[n.type] && n.type !== 'GROUP' && n.type !== 'BOOLEAN_OPERATION') st.allVector = false;
+      return;
+    }
+    if (n.type === 'BOOLEAN_OPERATION') return; // its children are consumed by the boolean
+    for (const c of n.children) walk(c, depth + 1);
+  })(node, 0);
+  if (st.text || st.instances || st.raster) st.allVector = false;
+  return st;
+}
+
+/**
+ * Decide whether a layer is a self-contained illustration that should ship as one
+ * SVG. Returns null for UI, or { reason, vectors, nodes, depth } for artwork.
+ * mode: 'auto' (default) | 'named' (name or explicit SVG export only) | 'off'.
+ */
+function illustrationPlan(node, mode) {
+  if (!node || node.visible === false || mode === 'off') return null;
+  if (typeof node.width !== 'number' || typeof node.height !== 'number') return null;
+  if (node.width <= 0 || node.height <= 0) return null;
+  const st = vectorScan(node);
+  if (!st.allVector || st.raster) return null;
+  if (st.vectors < 2) return null;                 // a single shape is not an illustration
+  if (st.nodes > ASSET_WALK_LIMIT) return null;    // too big to be one sane asset
+  if (st.maxDepth > 48) return null;               // deeply nested artwork exports poorly
+  const name = String(node.name || '');
+  const named = ILLUSTRATION_HINT.test(name) && !UI_NAME_HINT.test(name);
+  const complex = st.vectors >= 12 && (node.width > 256 || node.height > 256);
+  const stats = { vectors: st.vectors, nodes: st.nodes, depth: st.maxDepth };
+  if (st.svgExport) return Object.assign({ reason: 'svg-export' }, stats);
+  if (named) return Object.assign({ reason: 'name' }, stats);
+  if (mode === 'auto' && complex) return Object.assign({ reason: 'complexity' }, stats);
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
+/* Complexity assessment & limits                                      */
+/* ------------------------------------------------------------------ */
+const RUN_LIMITS = {
+  maxNodes: 6000,          // layers we will walk to describe a design
+  maxGenerateNodes: 2500,  // layers per code generation (the engine truncates past this)
+  maxDepth: MAX_DEPTH,
+  maxAssets: 400,
+  maxMs: 15000,
+  maxStoreKb: 200
+};
+/**
+ * Estimate how expensive a layer is before generating anything, so the panel can
+ * warn, offer a smaller selection or refuse, instead of freezing. Bounded: it
+ * stops at 6000 nodes and says so.
+ */
+function assessComplexity(node) {
+  const out = { nodes: 0, depth: 0, text: 0, vectors: 0, instances: 0, images: 0, components: 0, clipped: false, level: 'small', estimatedMs: 0, warnings: [] };
+  if (!node) return out;
+  (function walk(n, depth) {
+    if (out.nodes >= RUN_LIMITS.maxNodes || depth > MAX_DEPTH) { out.clipped = true; return; }
+    if (n.visible === false) return;
+    out.nodes++;
+    out.depth = Math.max(out.depth, depth);
+    if (n.type === 'TEXT') out.text++;
+    else if (VECTORISH[n.type]) out.vectors++;
+    else if (n.type === 'INSTANCE') out.instances++;
+    else if (n.type === 'COMPONENT' || n.type === 'COMPONENT_SET') out.components++;
+    if (hasImageFill(n)) out.images++;
+    if ('children' in n) n.children.forEach(c => walk(c, depth + 1));
+  })(node, 0);
+  // Deliberately conservative: a layout pass per node, an export per vector asset
+  // and a raster export per image fill.
+  out.estimatedMs = Math.round(out.nodes * 0.4 + out.vectors * 1.2 + out.images * 25);
+  out.level = out.nodes > 4000 ? 'extreme' : out.nodes > 1200 ? 'large' : out.nodes > 300 ? 'medium' : 'small';
+  if (out.clipped) out.warnings.push('This layer has more than ' + RUN_LIMITS.maxNodes.toLocaleString('en-US') + ' layers - counts stop there.');
+  if (out.depth > 80) out.warnings.push('Nesting is ' + out.depth + ' levels deep; layers past ' + MAX_DEPTH + ' are omitted.');
+  if (out.images > 40) out.warnings.push(out.images + ' image fills: exporting them takes a while.');
+  if (out.nodes > RUN_LIMITS.maxGenerateNodes) out.warnings.push('Past ' + RUN_LIMITS.maxGenerateNodes.toLocaleString('en-US') + ' layers the code is truncated - select a child frame for the rest.');
+  return out;
+}
+
+/** Bounded local storage (clientStorage) for projects and revision history. */
+async function storeGet(key) {
+  try {
+    const raw = await figma.clientStorage.getAsync('devready-' + key);
+    if (!raw) return null;
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (e) { diag('local storage', e); return null; }
+}
+async function storeSet(key, json) {
+  const text = String(json || '');
+  if (text.length > RUN_LIMITS.maxStoreKb * 1024) {
+    throw new Error('That is too much data to keep locally (' + Math.round(text.length / 1024) + ' kB, limit ' + RUN_LIMITS.maxStoreKb + ' kB).');
+  }
+  const parsed = JSON.parse(text); // reject garbage before it is persisted
+  await figma.clientStorage.setAsync('devready-' + key, JSON.stringify(parsed));
+  return true;
+}
+
+function collectAssets(root, limit, svgMode) {
   const out = [];
   let visited = 0;
-  (function walk(n) {
+  const mode = svgMode || 'auto';
+  (function walk(n, depth) {
     if (out.length >= limit || visited++ > 4000) return;
+    if (depth > MAX_DEPTH) return;
     if (n.visible === false) return;
     const hasExport = 'exportSettings' in n && n.exportSettings.length > 0;
+    if (n !== root) {
+      const illo = illustrationPlan(n, mode);
+      if (illo) {
+        out.push({ id: n.id, name: n.name, type: n.type, kind: 'illustration', reason: illo.reason, vectors: illo.vectors, formats: ['SVG'], w: round(n.width), h: round(n.height) });
+        return;
+      }
+    }
     if (hasExport) {
       out.push({ id: n.id, name: n.name, type: n.type, kind: 'export', formats: n.exportSettings.map(e => e.format + (e.constraint && e.constraint.type === 'SCALE' && e.constraint.value !== 1 ? '@' + e.constraint.value + 'x' : '')), w: round(n.width), h: round(n.height) });
       return;
     }
     if (n !== root && isIconLike(n)) { out.push({ id: n.id, name: n.name, type: n.type, kind: 'icon', w: round(n.width), h: round(n.height) }); return; }
     if (hasImageFill(n)) out.push({ id: n.id, name: n.name, type: n.type, kind: 'image', w: round(n.width), h: round(n.height) });
-    if ('children' in n) for (const c of n.children) walk(c);
-  })(root);
+    if ('children' in n) for (const c of n.children) walk(c, depth + 1);
+  })(root, 0);
   return out;
 }
 
@@ -934,12 +1217,19 @@ function applyGeometry(node, el, isRoot) {
   if (container && node.clipsContent && !c.overflow) c.overflow = 'hidden';
   return el;
 }
-async function buildRaw(node, ctx, isRoot, inInst) {
-  return applyGeometry(node, await buildRawNode(node, ctx, isRoot, inInst), isRoot);
+const JOBS = {};
+const ghReposCache = [];
+/* A cancelled job stops at the next layer instead of running to completion. */
+const CANCEL = { cancelled: true };
+function jobCancelled(ctx) { return !!(ctx && ctx.job && ctx.job.cancelled); }
+async function buildRaw(node, ctx, isRoot, inInst, depth) {
+  if (jobCancelled(ctx)) throw CANCEL;
+  return applyGeometry(node, await buildRawNode(node, ctx, isRoot, inInst, depth || 0), isRoot);
 }
-async function buildRawNode(node, ctx, isRoot, inInst) {
+async function buildRawNode(node, ctx, isRoot, inInst, depth) {
   if (node.visible === false || node.opacity === 0) return null;
   if (ctx.count >= ctx.max) { ctx.truncated = true; return null; }
+  if (depth > MAX_DEPTH) { ctx.truncated = true; ctx.depthLimited = true; return null; }
   ctx.count++;
   const el = { id: node.id, type: node.type, name: node.name, generic: nodeIsGeneric(node), kind: 'box', tag: 'div', css: {}, children: [], attrs: {}, inInst: !!inInst, w: node.width, h: node.height };
   const rawCss = await safeCSS(node);
@@ -972,6 +1262,33 @@ async function buildRawNode(node, ctx, isRoot, inInst) {
 
   const hasExport = 'exportSettings' in node && node.exportSettings.length > 0;
   const leafImage = hasImageFill(node) && !('children' in node && node.children.length);
+  // Self-contained vector artwork (illustrations, logos, complex diagrams) is one
+  // SVG asset. Its inner paths never become markup: they are unreachable nodes that
+  // cannot match the design pixel for pixel. A selected illustration frame is
+  // included, so generating code for artwork produces an image, not a guess.
+  const illo = illustrationPlan(node, ctx.svgFrames);
+  if (illo) {
+    el.kind = 'img'; el.tag = 'img';
+    el.base = 'illustration';
+    el.illustration = illo;
+    el.attrs.alt = node.name || 'Illustration';
+    const key = node.id;
+    let file = ctx.assetByKey[key];
+    if (!file) {
+      const baseName = cleanName(node.name) || 'illustration';
+      let fname = baseName, i = 1;
+      while (ctx.assetNames[fname]) fname = baseName + '-' + (++i);
+      ctx.assetNames[fname] = 1;
+      file = { id: node.id, file: fname + '.svg', format: 'SVG', scale: 1, varName: camel(fname) + 'Illustration', illustration: illo.reason };
+      ctx.assetByKey[key] = file;
+      ctx.assets.push(file);
+    }
+    el.asset = file;
+    const css = { width: round(node.width) + 'px', height: round(node.height) + 'px' };
+    LAYOUT_KEYS.forEach(k => { if (el.css[k] !== undefined) css[k] = el.css[k]; });
+    el.css = css;
+    return el;
+  }
   // TEXT stays accessible, selectable text even when a designer gave it export
   // settings. Asset export belongs to the Assets panel; it must not rasterise copy.
   if (node.type !== 'TEXT' && !isRoot && (isIconLike(node) || hasExport || leafImage)) {
@@ -1035,7 +1352,7 @@ async function buildRawNode(node, ctx, isRoot, inInst) {
   }
 
   if ('children' in node) {
-    const kids = await Promise.all(node.children.map(c => buildRaw(c, ctx, false, inInst || node.type === 'INSTANCE')));
+    const kids = await Promise.all(node.children.map(c => buildRaw(c, ctx, false, inInst || node.type === 'INSTANCE', depth + 1)));
     el.children = kids.filter(Boolean);
   }
   el.isBlock = !isRoot && (node.type === 'INSTANCE' || node.type === 'COMPONENT') && !!(el.comp || !el.generic);
@@ -1684,10 +2001,68 @@ function utf8(bytes) {
   for (let i = 0; i < bytes.length; i += 8192) b += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
   try { return decodeURIComponent(escape(b)); } catch (e) { return b; }
 }
-/** Exported SVG to inline-able markup: no XML header/comments, size comes from CSS. */
+/**
+ * Exported SVG to inline-able markup: no XML header/comments, size comes from CSS.
+ * Exported artwork is design content, but an SVG is also an executable document
+ * when it is ever loaded directly, so anything scriptable, remote or style-bearing
+ * is rejected rather than sanitised. Returns null → the caller embeds the raw
+ * bytes as a data URI in an <img>, where nothing inside can run.
+ */
+/* Elements that can execute, fetch or replace the document when an exported SVG is
+   inlined into generated HTML. `image`, `use` and `animate` are here because they
+   can pull a remote resource or rewrite an href to a script URL. */
+const SVG_BAD = /<\s*(script|foreignObject|iframe|object|embed|style|link|meta|base|audio|video|canvas|image|feImage|animate|animateMotion|animateTransform|set|handler|discard|listen)\b/i;
+/* Named/numeric entities are decoded before values are checked: `javascript&#58;`
+   is the same string to a browser but not to a naive regex. */
+const SVG_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", colon: ':', tab: '\t', newline: '\n', sol: '/' };
+function svgDecode(v) {
+  return String(v).replace(/&(#x?[0-9a-f]+|[a-z]+);?/gi, (m, body) => {
+    if (body[0] === '#') {
+      const code = body[1] === 'x' || body[1] === 'X' ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
+      return isFinite(code) && code > 0 && code < 0x110000 ? String.fromCharCode(code) : '';
+    }
+    const k = body.toLowerCase();
+    return Object.prototype.hasOwnProperty.call(SVG_ENTITIES, k) ? SVG_ENTITIES[k] : m;
+  });
+}
+/** Attributes of a raw `<tag …>` body, tokenised the way a parser reads them. */
+function svgAttrs(raw) {
+  const out = [];
+  const re = /([A-Za-z_:][-\w:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g;
+  let m;
+  while ((m = re.exec(raw))) {
+    out.push({ name: m[1].toLowerCase(), value: m[2] !== undefined ? m[2] : m[3] !== undefined ? m[3] : m[4] });
+  }
+  return out;
+}
+/** Anything that would execute or reach the network if this markup is inlined. */
+function svgUnsafe(t) {
+  if (/@import|expression\s*\(/i.test(t)) return true;
+  if (/url\(\s*['"]?\s*(?:https?:|\/\/|javascript:|vbscript:|data:text\/html)/i.test(svgDecode(t))) return true;
+  const re = /<\s*([A-Za-z][\w:.-]*)([^>]*)>/g;
+  let m;
+  while ((m = re.exec(t))) {
+    const tag = m[1].toLowerCase();
+    // `<use href="#id">` is safe (same document); an external one is caught by the href rule.
+    if (/^(script|foreignobject|iframe|object|embed|style|link|meta|base|audio|video|canvas|image|feimage|animate|animatemotion|animatetransform|set|handler|discard|listen)$/.test(tag)) return true;
+    const attrs = svgAttrs(svgDecode(m[2]));
+    for (const a of attrs) {
+      const name = a.name;
+      if (/^on/.test(name)) return true;
+      const value = svgDecode(a.value).replace(/[\u0000-\u001f\u007f\s]/g, '');
+      if (/(?:javascript|vbscript|data:text\/html|data:image\/svg\+xml):?/i.test(value) && /javascript|vbscript|text\/html|svg\+xml/i.test(value)) return true;
+      // href/src and friends may not leave the document (or the plugin's CSP)
+      if (/^(href|xlink:href|src|action|formaction|poster|data)$/.test(name) && /^(?:https?:|\/\/)/i.test(value)) return true;
+    }
+  }
+  return false;
+}
 function cleanSvg(text) {
-  let t = String(text).replace(/<\?xml[^>]*\?>/g, '').replace(/<[!]--[\s\S]*?--[>]/g, '').trim();
-  if (!/^<svg\b/.test(t) || t.length > 200000 || /<script\b|\son[a-z]+\s*=/i.test(t)) return null;
+  let t = String(text).replace(/<\?xml[^>]*\?>/g, '').replace(/<[!]--[\s\S]*?--[>]/g, '').replace(/<!DOCTYPE[^>]*>/gi, '').trim();
+  if (!/^<svg\b/.test(t) || t.length > 200000) return null;
+  if (SVG_BAD.test(t)) return null;
+  if (/javascript:/i.test(t)) return null;
+  if (svgUnsafe(t)) return null;
   t = t.replace(/^<svg\b([^>]*)>/, (m, attrs) => '<svg' + attrs.replace(/\s(width|height)="[^"]*"/g, '') + '>');
   return t;
 }
@@ -1701,8 +2076,37 @@ function embedImage(ctx, name, value) {
   ctx.embed.names[n] = 1; ctx.embed.byValue[value] = n; ctx.embed.list.push({ name: n, value: value });
   return n;
 }
+/* Text scripts decide the document language and direction, so a screen reader
+   announces an Arabic or Japanese design correctly. Latin-only designs keep
+   lang="en" and no dir attribute, as before. */
+const DOC_SCRIPTS = [
+  { re: /[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]/g, lang: 'ar', rtl: true },
+  { re: /[\u0590-\u05FF]/g, lang: 'he', rtl: true },
+  { re: /[\u0900-\u097F]/g, lang: 'hi' },
+  { re: /[\u0E00-\u0E7F]/g, lang: 'th' },
+  { re: /[\u3040-\u30FF]/g, lang: 'ja' },
+  { re: /[\uAC00-\uD7AF]/g, lang: 'ko' },
+  { re: /[\u4E00-\u9FFF]/g, lang: 'zh' },
+  { re: /[\u0400-\u04FF]/g, lang: 'ru' }
+];
+function docLang(root) {
+  let text = '';
+  walk(root, e => {
+    if (e.kind === 'text' && e.text && text.length < 4000) text += ' ' + String(e.text).slice(0, 4000);
+  });
+  let best = null;
+  DOC_SCRIPTS.forEach(sc => {
+    const hits = (text.match(sc.re) || []).length;
+    if (hits && (!best || hits > best.hits)) best = { lang: sc.lang, rtl: !!sc.rtl, hits: hits };
+  });
+  return best || { lang: 'en', rtl: false, hits: 0 };
+}
+function htmlOpenTag(root) {
+  const l = docLang(root);
+  return '<html lang="' + l.lang + '"' + (l.rtl ? ' dir="rtl"' : '') + '>';
+}
 function singleHtml(node, root, ctx, unit, base, note) {
-  return '<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8" />\n  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n  <title>' + escHtml(node.name) + '</title>\n' +
+  return '<!DOCTYPE html>\n' + htmlOpenTag(root) + '\n<head>\n  <meta charset="UTF-8" />\n  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n  <title>' + escHtml(node.name) + '</title>\n' +
     fontHead(ctx.fontPlan) +
     '  <!' + '-- Single-file build from Figma (DevReady) · open it directly in any browser. CSS and assets are embedded. --' + '>\n' +
     '  <style>\n/* Page preview canvas */\nbody { margin: 0; min-height: 100vh; display: flex; justify-content: center; align-items: flex-start; padding: 40px 16px; box-sizing: border-box; background: #F5F5F5; }\n\n' +
@@ -1715,20 +2119,24 @@ function singleHtml(node, root, ctx, unit, base, note) {
  * lang: 'html-css' | 'react-tailwind' | 'react-css'
  * returns { files: [{name, lang, code}], assets: [{id,file,format,scale}], truncated, stats }
  */
-async function generateCode(node, lang, unit, base, maxNodes, opts) {
+async function generateCodeInner(node, lang, unit, base, maxNodes, opts) {
   opts = opts || {};
+  const isReact = /^react-/.test(lang);
+  const svgMode = opts.svgFrames || settings.svgFrames || 'auto';
   const ctx = { lang: lang, count: 0, max: maxNodes || 600, truncated: false, maxFont: 0, assets: [], assetByKey: {}, assetNames: {}, vars: {}, classes: {}, order: [], weights: {}, usedTitle: false, rootWidth: node.width,
-    varIds: {}, themes: {}, tokenInfo: {}, imports: {}, fonts: {}, react: /^react-(tailwind|css)$/.test(lang), mappings: /^react-(tailwind|css)$/.test(lang) ? loadMappings() : {} };
-  const root = await buildRaw(node, ctx, true);
+    varIds: {}, themes: {}, tokenInfo: {}, imports: {}, fonts: {}, react: isReact, mappings: isReact ? loadMappings() : {} };
+  ctx.svgFrames = svgMode;
+  ctx.job = opts.job || null;
+  const root = await buildRaw(node, ctx, true, false, 0);
   if (!root) return { files: [{ name: 'empty.txt', lang: 'text', code: 'Nothing visible to generate.' }], assets: [] };
   await resolveAutoLineHeights(root, ctx, lang);
   structurePass(root, null, ctx, null);
   walk(root, e => { if (e.css['font-weight']) ctx.weights[e.css['font-weight']] = 1; (e.runs || []).forEach(r => { if (r.css && r.css['font-weight']) ctx.weights[r.css['font-weight']] = 1; }); });
   hoistFont(root);
   collectVars(root, ctx);
-  try { await resolveThemes(ctx); } catch (e) { /* variables API unavailable */ }
+  try { await resolveThemes(ctx); } catch (e) { diag('variable modes', e); }
   let fontPlan = { google: [], faces: [], files: [], families: [] };
-  try { fontPlan = await planFonts(ctx, lang, !!opts.withFonts, !!opts.fastFonts); } catch (e) { /* ignore */ }
+  try { fontPlan = await planFonts(ctx, lang, !!opts.withFonts, !!opts.fastFonts); } catch (e) { diag('font availability', e); }
   applyFontStacks(root, ctx, fontPlan);
   ctx.fontPlan = fontPlan;
   ctx.rootFont = root.css['font-family'] || '';
@@ -1749,8 +2157,11 @@ async function generateCode(node, lang, unit, base, maxNodes, opts) {
   const Comp = pascal(rootName);
   ctx.rootName = Comp;
   const notes = [];
-  if (ctx.truncated) notes.push('Output truncated after ' + ctx.max + ' layers — select a smaller frame for full code.');
+  if (ctx.depthLimited) notes.push('Layer tree deeper than ' + MAX_DEPTH + ' levels — nested layers beyond that are omitted. Select a child frame for the rest.');
+  if (ctx.truncated && !ctx.depthLimited) notes.push('Output truncated after ' + ctx.max + ' layers — select a smaller frame for full code.');
   if (ctx.autoLineHeight) notes.push(ctx.autoLineHeight + ' text layer' + (ctx.autoLineHeight === 1 ? '' : 's') + ' could not be measured; browser font metrics can differ. Set an explicit line-height for pixel-exact output.');
+  const illos = (ctx.assets || []).filter(a => a.illustration);
+  if (illos.length) notes.push(illos.length + ' vector illustration' + (illos.length === 1 ? '' : 's') + ' exported as SVG (' + illos.slice(0, 3).map(a => a.file).join(', ') + (illos.length > 3 ? ', ...' : '') + '). Inner vector layers are not converted to code.');
   if (ctx.assetErrors && ctx.assetErrors.length) notes.push(ctx.assetErrors.length + ' asset export issue' + (ctx.assetErrors.length === 1 ? '' : 's') + ' — download the project for details or retry in Figma.');
   const note = notes.join(' ');
   const files = [];
@@ -1774,7 +2185,7 @@ async function generateCode(node, lang, unit, base, maxNodes, opts) {
   } else if (lang === 'html-single') {
     files.push({ name: rootName + '.html', lang: 'html', code: singleHtml(node, root, ctx, unit, base, note) });
   } else if (lang === 'html-css') {
-    const html = '<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8" />\n  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n  <title>' + escHtml(node.name) + '</title>\n' +
+    const html = '<!DOCTYPE html>\n' + htmlOpenTag(root) + '\n<head>\n  <meta charset="UTF-8" />\n  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n  <title>' + escHtml(node.name) + '</title>\n' +
       fontHead(ctx.fontPlan) + '  <link rel="stylesheet" href="styles.css" />\n</head>\n<body>\n' +
       (note ? '  <!' + '-- ' + note + ' --' + '>\n' : '') + renderHTML(root, 1) + '\n</body>\n</html>\n';
     files.push({ name: 'index.html', lang: 'html', code: html });
@@ -1813,14 +2224,36 @@ async function generateCode(node, lang, unit, base, maxNodes, opts) {
   }
   return {
     files: files,
-    assets: ctx.assets.filter(a => !a.src && !a.svg).map(a => ({ id: a.id, file: a.file, format: a.format, scale: a.scale, imageHash: a.imageHash || '', cssOnly: !!a.cssOnly })),
+    assets: ctx.assets.filter(a => !a.src && !a.svg).map(a => ({ id: a.id, file: a.file, format: a.format, scale: a.scale, imageHash: a.imageHash || '', cssOnly: !!a.cssOnly, illustration: a.illustration || '' })),
     fonts: fontPlan.families,
     fontFiles: opts.withFonts ? fontPlan.files : undefined,
     preview: { w: round(node.width), h: round(node.height), inlinedKB: Math.round(inlined / 1024) },
     truncated: ctx.truncated,
+    depthLimited: !!ctx.depthLimited,
     assetErrors: ctx.assetErrors || [],
     stats: { layers: ctx.count, classes: ctx.order.length, assets: ctx.assets.length, tokens: Object.keys(ctx.vars).length, modes: Object.keys(ctx.themes).length, mapped: Object.keys(ctx.imports).reduce((n, p) => n + Object.keys(ctx.imports[p]).length, 0) }
   };
+}
+/**
+ * Last-resort guard. Codegen must never throw into Figma's UI: a pathological
+ * tree, a remote library outage or an unexpected API shape should produce a
+ * readable explanation the user can act on, not a dead panel.
+ */
+async function generateCode(node, lang, unit, base, maxNodes, opts) {
+  try {
+    return await generateCodeInner(node, lang, unit, base, maxNodes, opts);
+  } catch (e) {
+    if (e === CANCEL) return { files: [], assets: [], fonts: [], cancelled: true, truncated: false, stats: {} };
+    const msg = String((e && e.message) || e).slice(0, 300);
+    return {
+      files: [{ name: 'error.txt', lang: 'text', code: 'DevReady could not generate code for this layer.\n\n' + msg + '\n\nTry selecting a smaller frame, or a child frame of the design.' }],
+      assets: [], fonts: [], fontFiles: undefined,
+      preview: { w: round(node && node.width) || 0, h: round(node && node.height) || 0, inlinedKB: 0 },
+      truncated: false, depthLimited: false, assetErrors: [msg],
+      error: msg,
+      stats: { layers: 0, classes: 0, assets: 0, tokens: 0, modes: 0, mapped: 0 }
+    };
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1829,23 +2262,36 @@ async function generateCode(node, lang, unit, base, maxNodes, opts) {
 
 /* ---------- variable modes ---------- */
 const collCache = {};
+/**
+ * Collection lookup. Variables that come from a library live in a collection the
+ * file does not own: `getVariableCollectionByIdAsync` resolves them in current
+ * Figma builds but has returned null in older ones, which used to drop those
+ * variables from the token export entirely. Fall back to the published list.
+ */
 async function getColl(id) {
   if (collCache[id] !== undefined) return collCache[id];
   let c = null;
-  try { c = await figma.variables.getVariableCollectionByIdAsync(id); } catch (e) { /* remote */ }
+  try { c = await figma.variables.getVariableCollectionByIdAsync(id); } catch (e) { /* not this build */ }
+  if (!c) {
+    try {
+      const libs = await figma.variables.getAvailableLibraryVariableCollectionsAsync();
+      const hit = (libs || []).filter(x => x && x.id === id)[0];
+      if (hit) c = { id: hit.id, key: hit.key, name: hit.name, modes: hit.modes, defaultModeId: hit.defaultModeId, remote: true };
+    } catch (e) { /* no libraries / older Figma */ }
+  }
   collCache[id] = c;
   return c;
 }
 async function resolveVarValue(val, modeId, depth) {
   if (val && typeof val === 'object' && val.type === 'VARIABLE_ALIAS') {
-    if (depth > 6) return { value: null };
+    if (depth > 6) return { value: null, cycle: true };
     let v = null;
     try { v = await figma.variables.getVariableByIdAsync(val.id); } catch (e) { /* ignore */ }
-    if (!v) return { value: null };
+    if (!v) return { value: null, remote: true };
     let mv = v.valuesByMode[modeId];
     if (mv === undefined) { const c = await getColl(v.variableCollectionId); mv = c ? v.valuesByMode[c.defaultModeId] : v.valuesByMode[Object.keys(v.valuesByMode)[0]]; }
     const inner = await resolveVarValue(mv, modeId, depth + 1);
-    return { value: inner.value, alias: inner.alias || v.name };
+    return { value: inner.value, alias: inner.alias || v.name, cycle: inner.cycle, remote: inner.remote };
   }
   return { value: val };
 }
@@ -1871,9 +2317,12 @@ async function varModes(id) {
     const c = await getColl(v.variableCollectionId);
     base.cssName = base.web && /var\((--[^),\s]+)/.test(base.web) ? /var\((--[^),\s]+)/.exec(base.web)[1] : '--' + v.name.replace(/\//g, '-').replace(/\s+/g, '-');
     base.modes = [];
+    base.remote = !!(c && c.remote);
     if (c) {
       base.defaultModeId = c.defaultModeId;
-      for (const m of c.modes) {
+      const modes = c.modes && c.modes.length ? c.modes : Object.keys(v.valuesByMode || {}).map((mid, i) => ({ modeId: mid, name: i ? 'Mode ' + (i + 1) : 'Default' }));
+      base.defaultModeId = base.defaultModeId || (modes[0] && modes[0].modeId);
+      for (const m of modes) {
         const r = await resolveVarValue(v.valuesByMode[m.modeId], m.modeId, 0);
         base.modes.push({
           id: m.modeId, name: m.name, isDefault: m.modeId === c.defaultModeId,
@@ -1883,7 +2332,7 @@ async function varModes(id) {
         });
       }
     }
-  } catch (e) { base.modes = []; }
+  } catch (e) { base.modes = []; diag('variable modes', e); }
   return base;
 }
 function collectVarIds(node, ctx) {
@@ -1932,21 +2381,82 @@ async function resolveThemes(ctx) {
 /* ---------- change tracking ("changed since ready") ---------- */
 function hashStr(s) { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); }
 function safeVal(v) { return isMixed(v) ? 'mixed' : v; }
+/**
+ * Values that Figma reports as `figma.mixed` used to collapse to the string
+ * "mixed", so editing one corner radius, one stroke side or one text run was
+ * invisible to change tracking. Each item is now hashed individually.
+ */
+function radiusSig(n) {
+  if (!('cornerRadius' in n)) return 0;
+  if (isMixed(n.cornerRadius)) {
+    try { return [n.topLeftRadius, n.topRightRadius, n.bottomRightRadius, n.bottomLeftRadius].map(v => safeVal(v)).join('/'); } catch (e) { return 'mixed'; }
+  }
+  return safeVal(n.cornerRadius);
+}
+function strokeSig(n) {
+  if (!('strokes' in n)) return 0;
+  let weight;
+  try {
+    weight = isMixed(n.strokeWeight)
+      ? [n.strokeTopWeight, n.strokeRightWeight, n.strokeBottomWeight, n.strokeLeftWeight].map(v => safeVal(v)).join('/')
+      : safeVal(n.strokeWeight);
+  } catch (e) { weight = 'mixed'; }
+  return JSON.stringify([safeVal(n.strokes), weight, safeVal(n.strokeAlign), safeVal(n.strokeCap), safeVal(n.strokeJoin),
+    Array.isArray(n.dashPattern) ? n.dashPattern.join(',') : safeVal(n.dashPattern)]);
+}
+/** Variable and style bindings: switching a hex to a variable of the same colour is a change. */
+function bindSig(n) {
+  let bv;
+  try {
+    const b = n.boundVariables || {};
+    bv = Object.keys(b).sort().map(k => {
+      const v = b[k], one = x => (x && x.id) ? x.id : '';
+      return k + ':' + (Array.isArray(v) ? v.map(one).join('+') : one(v));
+    }).join(',');
+  } catch (e) { bv = ''; }
+  const id = v => { try { return safeVal(v) || ''; } catch (e) { return ''; } };
+  let modes;
+  try { modes = JSON.stringify(n.explicitVariableModes || {}); } catch (e) { modes = ''; }
+  return [bv, id(n.fillStyleId), id(n.strokeStyleId), id(n.effectStyleId), id(n.textStyleId), modes].join('|');
+}
+/** Per-run text styling: a single changed word is a change even if the node's own props don't move. */
+function textSig(n) {
+  let segs = '';
+  try {
+    if (n.getStyledTextSegments) {
+      const list = n.getStyledTextSegments(['fontName', 'fontSize', 'fontWeight', 'lineHeight', 'letterSpacing', 'fills', 'textDecoration', 'textCase']);
+      if (list) segs = list.map(x => JSON.stringify([x.characters, safeVal(x.fontName), safeVal(x.fontSize), safeVal(x.fontWeight), safeVal(x.lineHeight), safeVal(x.letterSpacing), x.fills, safeVal(x.textDecoration), safeVal(x.textCase)])).join('~');
+    }
+  } catch (e) { segs = 'unavailable'; }
+  try {
+    return n.characters + '|' + JSON.stringify([n.fontSize, n.fontName, n.lineHeight, n.letterSpacing, n.textAlignHorizontal, n.textAlignVertical, n.textAutoResize, n.paragraphSpacing, n.textTruncate].map(safeVal)) + '|' + segs;
+  } catch (e) { return ''; }
+}
+function gridSig(n) {
+  try { return n.layoutGrids ? JSON.stringify(n.layoutGrids) : ''; } catch (e) { return ''; }
+}
+function constraintSig(n) {
+  const out = [];
+  try { if (n.constraints) out.push(JSON.stringify(n.constraints)); } catch (e) { /* ignore */ }
+  ['minWidth', 'maxWidth', 'minHeight', 'maxHeight', 'layoutSizingHorizontal', 'layoutSizingVertical', 'layoutPositioning', 'itemReverseZIndex', 'clipsContent', 'isMask', 'blendMode'].forEach(k => {
+    try { if (k in n) out.push(k + '=' + safeVal(n[k])); } catch (e) { /* ignore */ }
+  });
+  return out.join(';');
+}
 function nodeSig(n) {
   const g = [round(n.x, 1), round(n.y, 1), round(n.width, 1), round(n.height, 1), n.rotation ? round(n.rotation, 1) : 0].join(',');
   let st = '';
   try {
     st = JSON.stringify([
-      'fills' in n ? safeVal(n.fills) : 0, 'strokes' in n ? n.strokes : 0, 'strokeWeight' in n ? safeVal(n.strokeWeight) : 0,
-      'effects' in n ? n.effects : 0, 'cornerRadius' in n ? safeVal(n.cornerRadius) : 0, 'opacity' in n ? n.opacity : 1, n.visible,
-      'layoutMode' in n ? [n.layoutMode, n.itemSpacing, n.paddingTop, n.paddingRight, n.paddingBottom, n.paddingLeft, n.primaryAxisAlignItems, n.counterAxisAlignItems, n.layoutWrap] : 0
+      'fills' in n ? safeVal(n.fills) : 0, strokeSig(n),
+      'effects' in n ? n.effects : 0, radiusSig(n), 'opacity' in n ? n.opacity : 1, n.visible,
+      'layoutMode' in n ? [n.layoutMode, n.itemSpacing, n.counterAxisSpacing, n.paddingTop, n.paddingRight, n.paddingBottom, n.paddingLeft, n.primaryAxisAlignItems, n.counterAxisAlignItems, n.layoutWrap, n.gridRowCount, n.gridColumnCount] : 0
     ]);
   } catch (e) { /* ignore */ }
-  let tx = '';
-  if (n.type === 'TEXT') {
-    try { tx = n.characters + '|' + JSON.stringify([n.fontSize, n.fontName, n.lineHeight, n.letterSpacing, n.textAlignHorizontal].map(safeVal)); } catch (e) { /* ignore */ }
-  }
-  return [hashStr(g), hashStr(st), tx ? hashStr(tx) : ''];
+  let meta;
+  try { meta = bindSig(n) + '#' + gridSig(n) + '#' + constraintSig(n); } catch (e) { meta = ''; }
+  const tx = n.type === 'TEXT' ? textSig(n) : '';
+  return [hashStr(g), hashStr(st + '#' + meta), tx ? hashStr(tx) : ''];
 }
 /* Compact, human-readable values stored next to the hashes so the Changes panel can
    show "before → after". Hashes stay the source of truth for *whether* something
@@ -1971,9 +2481,29 @@ function nodeVals(n) {
     if (n.visible === false) v.vis = 'hidden';
     if ('opacity' in n && n.opacity !== 1 && typeof n.opacity === 'number') v.op = Math.round(n.opacity * 100) + '%';
     if ('fills' in n && n.type !== 'TEXT') { const f = paintVal(n.fills); if (f) v.fill = f; }
-    if ('strokes' in n) { const st = paintVal(n.strokes); if (st) v.stroke = st + ' · ' + r1(n.strokeWeight); }
-    if ('cornerRadius' in n && n.cornerRadius) v.rad = isMixed(n.cornerRadius) ? [n.topLeftRadius, n.topRightRadius, n.bottomRightRadius, n.bottomLeftRadius].map(r1).join(' ') : r1(n.cornerRadius);
-    if ('effects' in n && Array.isArray(n.effects)) { const e = n.effects.filter(x => x && x.visible !== false); if (e.length) v.fx = e.map(x => String(x.type).toLowerCase().replace(/_/g, ' ') + (x.radius ? ' ' + r1(x.radius) : '')).join(', '); }
+    if ('strokes' in n) {
+      const st = paintVal(n.strokes);
+      // Per-side stroke weights are mixed: keep them readable instead of "mixed".
+      let w = '';
+      try {
+        w = isMixed(n.strokeWeight)
+          ? [n.strokeTopWeight, n.strokeRightWeight, n.strokeBottomWeight, n.strokeLeftWeight].map(r1).join(' ')
+          : r1(n.strokeWeight);
+      } catch (e) { w = 'mixed'; }
+      if (st) v.stroke = st + (w ? ' · ' + w : '');
+    }
+    if ('cornerRadius' in n && (n.cornerRadius || isMixed(n.cornerRadius))) v.rad = isMixed(n.cornerRadius) ? [n.topLeftRadius, n.topRightRadius, n.bottomRightRadius, n.bottomLeftRadius].map(r1).join(' ') : r1(n.cornerRadius);
+    if ('effects' in n && Array.isArray(n.effects)) {
+      const e = n.effects.filter(x => x && x.visible !== false);
+      if (e.length) {
+        v.fx = e.map(x => {
+          const kind = String(x.type).toLowerCase().replace(/_/g, ' ');
+          const off = (x.offset && (x.offset.x || x.offset.y)) ? 'x' + r1(x.offset.x) + ' y' + r1(x.offset.y) : '';
+          const geo = [x.radius ? r1(x.radius) : '', x.spread ? 'spread ' + r1(x.spread) : '', off].filter(Boolean).join(' ');
+          return kind + (geo ? ' ' + geo : '');
+        }).join(', ');
+      }
+    }
     if ('layoutMode' in n && n.layoutMode && n.layoutMode !== 'NONE') {
       v.lay = (n.layoutMode === 'VERTICAL' ? 'column' : n.layoutMode === 'GRID' ? 'grid' : 'row') + (n.layoutWrap === 'WRAP' ? ' wrap' : '') + ' · gap ' + (n.primaryAxisAlignItems === 'SPACE_BETWEEN' ? 'auto' : r1(n.itemSpacing)) + ' · ' + String(n.primaryAxisAlignItems || '').toLowerCase() + '/' + String(n.counterAxisAlignItems || '').toLowerCase();
       v.pad = [n.paddingTop, n.paddingRight, n.paddingBottom, n.paddingLeft].map(r1).join(' ');
@@ -2000,6 +2530,12 @@ function valDiff(a, b) {
   return out;
 }
 const SNAP_LIMIT = 2500;
+/* A layer cap alone does not bound the snapshot: 2,500 layers with text, effects
+   and fills serialise to ~1 MB, and shared plugin data is not free (Figma throttles
+   and can reject oversized writes on large files). Stop at a byte budget too, and
+   mark the snapshot partial so the panel never claims "no changes" for the layers
+   it did not see. */
+const SNAP_BYTES = 400000;
 /* Figma caps each plugin-data entry at 100 kB (enforced since March 2025), so large
    values are split across "<key>:0..n" entries. 30k UTF-16 units is < 90 kB even
    when every unit needs 3 bytes of UTF-8. */
@@ -2019,16 +2555,24 @@ function readChunked(node, key) {
   for (let i = 0; i < n; i++) out += node.getSharedPluginData(NS, key + ':' + i);
   return out;
 }
-function snapshot(root, limit) {
-  const map = {}; let count = 0;
-  (function walk(n) {
-    if (count >= limit) { map.__partial = 1; return; }
+function snapshot(root, limit, budget) {
+  const map = {}; let count = 0; let size = 0;
+  const cap = typeof budget === 'number' ? budget : SNAP_BYTES;
+  let truncated = false;
+  (function walk(n, depth) {
+    if (truncated) return;
+    if (count >= limit || size >= cap) { truncated = true; return; }
+    if (depth > MAX_DEPTH) { truncated = true; return; }
     count++;
     const s = nodeSig(n);
     const v = nodeVals(n);
-    map[n.id] = v ? [String(n.name).slice(0, 40), s[0], s[1], s[2], v] : [String(n.name).slice(0, 40), s[0], s[1], s[2]];
-    if ('children' in n) n.children.forEach(walk);
-  })(root);
+    const rec = v ? [String(n.name).slice(0, 40), s[0], s[1], s[2], v] : [String(n.name).slice(0, 40), s[0], s[1], s[2]];
+    map[n.id] = rec;
+    size += JSON.stringify(rec).length + 12; // + key, quotes and commas
+    if ('children' in n) n.children.forEach(c => walk(c, depth + 1));
+  })(root, 0);
+  // Layers past any limit are unknown, so added/removed must not be claimed.
+  if (truncated) map.__partial = 1;
   return map;
 }
 function saveBaseline(target) {
@@ -2073,7 +2617,7 @@ function diffBaseline(target) {
   } else {
     Object.keys(base).forEach(id => { if (!now[id]) changes.push({ id: null, name: base[id][0], kind: 'removed', parts: [] }); });
   }
-  const res = { at: target.getSharedPluginData(NS, 'baselineAt'), partial: partial, values: Object.keys(base).some(k => base[k] && base[k][4]), limit: SNAP_LIMIT, count: changes.length, changes: changes.slice(0, 150), containerId: target.id, containerName: target.name };
+  const res = { at: target.getSharedPluginData(NS, 'baselineAt'), partial: partial, values: Object.keys(base).some(k => base[k] && base[k][4]), limit: SNAP_LIMIT, budget: SNAP_BYTES, count: changes.length, changes: changes.slice(0, 150), containerId: target.id, containerName: target.name };
   diffCache[target.id] = res;
   return res;
 }
@@ -2087,7 +2631,7 @@ function loadMappings() {
         // file data can be written by anyone who edits the file (or another plugin): re-validate
         const m = JSON.parse(figma.root.getSharedPluginData(NS, k));
         if (m && MAP_NAME_RE.test(m.name) && MAP_PATH_RE.test(m.path)) out[k.slice(4)] = { name: m.name, path: m.path, at: String(m.at || '') };
-      } catch (e) { /* ignore */ }
+      } catch (e) { diag('component mappings', e); }
     });
   } catch (e) { /* ignore */ }
   return out;
@@ -2915,44 +3459,221 @@ function isInteractive(n) {
   } catch (e) { /* ignore */ }
   return /^(FRAME|INSTANCE|COMPONENT)$/.test(n.type) && TARGET_NAME_RE.test(n.name || '');
 }
-function a11yAudit(root, limit) {
+/** WCAG references attached to each finding, so a report can cite the rule. */
+const A11Y_RULE = {
+  contrast: '1.4.3', size: 'readability', target: '2.5.8', label: '4.1.2',
+  nonText: '1.4.11', alt: '1.1.1', heading: '1.3.1', form: '3.3.2'
+};
+const A11Y_RULE_TITLE = {
+  '1.4.3': 'Text contrast', '1.4.11': 'Non-text contrast', '1.1.1': 'Image alternative',
+  '1.3.1': 'Info and relationships', '2.5.8': 'Target size', '4.1.2': 'Name, role, value',
+  '3.3.2': 'Labels or instructions', readability: 'Readability'
+};
+/** Review decisions are kept per file, so ignoring a finding is visible to the team. */
+const A11Y_IGNORE_KEY = 'a11y-ignore';
+const A11Y_IGNORE_MAX = 120;
+const A11Y_REASONS = ['Decorative', 'Brand exception', 'Legacy design', 'False positive', 'Will fix later', 'Approved by design'];
+const AUTO_LAYER_NAME_RE = /^(image|img|bitmap|picture|photo|rectangle|rounded ?rectangle|ellipse|vector|group|frame|shape|layer|mask|graphic)([\s._-]*\d+)?$/i;
+const DECORATIVE_NAME_RE = /(decorat|background|\bbg\b|pattern|texture|blob|spacer|divider|separator|shadow|glow|noise)/i;
+const FIELD_NAME_RE = /(^|[\s/_-])(input|field|text ?field|search|email|username|password|select|combobox|dropdown|textarea|checkbox|radio|toggle|phone|number field)([\s/_-]|$)/i;
+const ICON_NAME_RE = /(^|[\s/_.-])(icon|icons|glyph|glyphs|ic)([\s/_.-]|$)/i;
+/** Does this layer live under something the team calls an icon? A raster icon is
+ *  artwork, so asking for alt text there would be noise. */
+function inIconContext(n) {
+  let c = n, guard = 0;
+  while (c && guard++ < 4) {
+    if (ICON_NAME_RE.test(String(c.name || ''))) return true;
+    c = c.parent;
+  }
+  return false;
+}
+/** Alt-text decision for a layer that carries an image. */
+function altDecision(n) {
+  const name = String(n.name || '').trim();
+  if (!name) return { status: 'warn', detail: 'Unnamed image — rename the layer so its alt text can be written' };
+  if (DECORATIVE_NAME_RE.test(name)) return { status: 'pass', detail: 'Looks decorative — export it with alt="" and aria-hidden' };
+  if (AUTO_LAYER_NAME_RE.test(name)) return { status: 'warn', detail: 'Layer name "' + name.slice(0, 32) + '" is auto-generated — rename it to describe the image, or mark it decorative' };
+  return { status: 'pass', detail: 'Descriptive layer name — use it as the alt text' };
+}
+/** Heading level suggested by the type scale (0 = body text). */
+function headingLevel(size, weight) {
+  if (!(size > 0)) return 0;
+  if (size >= 32) return 1;
+  if (size >= 24) return 2;
+  if (size >= 20) return 3;
+  if (size >= 18 && weight >= 700) return 4;
+  return 0;
+}
+/** Is there readable text in this subtree? A manual walk, so it works on every
+ *  Figma API version (findOne is not available on every node type). */
+function hasVisibleText(n) {
+  if (!n) return false;
+  if (n.type === 'TEXT') return !!String(n.characters || '').trim();
+  let found = false;
+  (function walk(x, depth) {
+    if (found || depth > 40 || !('children' in x)) return;
+    for (const c of x.children) {
+      if (found) return;
+      if (c.visible === false) continue;
+      if (c.type === 'TEXT' && String(c.characters || '').trim()) { found = true; return; }
+      walk(c, depth + 1);
+    }
+  })(n, 0);
+  return found;
+}
+/** The paint an icon actually draws with: its own, or the first one inside it. */
+function firstSolidPaint(n) {
+  const own = topSolid(n.fills) || topSolid(n.strokes);
+  if (own && !own.unknown) return own;
+  let found = null;
+  (function walk(x, depth) {
+    if (found || depth > 6) return;
+    const f = topSolid(x.fills) || topSolid(x.strokes);
+    if (f && !f.unknown) { found = f; return; }
+    if ('children' in x) x.children.forEach(c => walk(c, depth + 1));
+  })(n, 0);
+  return found;
+}
+async function readA11yIgnore() {
+  try {
+    const raw = figma.root.getSharedPluginData(NS, A11Y_IGNORE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out = {};
+    Object.keys(parsed).slice(0, A11Y_IGNORE_MAX).forEach(k => {
+      if (typeof k === 'string' && k.length < 80 && typeof parsed[k] === 'string') out[k] = parsed[k].slice(0, 120);
+    });
+    return out;
+  } catch (e) { return {}; }
+}
+function writeA11yIgnore(map) {
+  const keys = Object.keys(map).slice(0, A11Y_IGNORE_MAX);
+  const clean = {};
+  keys.forEach(k => { clean[k] = String(map[k] || 'Ignored').slice(0, 120); });
+  const text = JSON.stringify(clean);
+  // Shared plugin data is per file and readable by collaborators: keep it small and plain.
+  figma.root.setSharedPluginData(NS, A11Y_IGNORE_KEY, text.length <= 20000 ? text : '{}');
+  return clean;
+}
+/**
+ * Opacity that actually reaches a layer: Figma multiplies a layer's opacity with
+ * every ancestor's. Reading only the layer's own value makes faded content look
+ * fully opaque, which produced false "AA pass" results.
+ */
+function effectiveOpacity(node) {
+  let o = 1, c = node, guard = 0;
+  while (c && guard++ < 60) {
+    if (c.visible === false) return 0;
+    if (typeof c.opacity === 'number') o *= c.opacity;
+    if (c.opacity === 0) return 0;
+    if (c.parent && (c.parent.type === 'PAGE' || c.parent.type === 'DOCUMENT')) break;
+    c = c.parent;
+  }
+  return Math.max(0, Math.min(1, o));
+}
+/**
+ * WCAG 2.2 audit.
+ *
+ * Text contrast (1.4.3), non-text contrast for icons and control boundaries
+ * (1.4.11), image alternatives (1.1.1), heading order (1.3.1), field labels
+ * (3.3.2), target size (2.5.8), readable type, and a nameless-control check
+ * (4.1.2). Findings can be reviewed per file with a reason, and the whole audit
+ * can be exported as Markdown or CSV.
+ */
+function a11yAudit(root, limit, ignoreMap) {
+  const ignore = ignoreMap || {};
   const items = [];
-  let scanned = 0, limited = false;
-  const frameWidth = n => { let c = n; while (c.parent && c.parent.type !== 'PAGE' && c.parent.type !== 'DOCUMENT' && c.parent.type !== 'SECTION') c = c.parent; return c.width || 9999; };
-  const visit = n => {
+  const ignoredItems = [];
+  const headings = [];
+  let scanned = 0, limited = false, depthLimited = false;
+  const push = it => {
+    if (ignore[it.id]) ignoredItems.push(Object.assign({}, it, { reason: ignore[it.id] }));
+    else items.push(it);
+  };
+  const frameWidth = n => { let c = n, g = 0; while (c.parent && g++ < 60 && c.parent.type !== 'PAGE' && c.parent.type !== 'DOCUMENT' && c.parent.type !== 'SECTION') c = c.parent; return c.width || 9999; };
+  const visit = (n, depth) => {
     if (n.visible === false) return;
     if (scanned >= (limit || 400)) { limited = true; return; }
+    if (depth > MAX_DEPTH) { depthLimited = true; return; }
     scanned++;
     if (n.type === 'TEXT' && n.characters && String(n.characters).trim()) {
       const fg = textFill(n), size = isMixed(n.fontSize) ? 16 : n.fontSize;
       const weight = isMixed(n.fontWeight) ? 400 : (n.fontWeight || 400);
-      if (fg && !fg.unknown) {
+      const op = effectiveOpacity(n);
+      if (fg && !fg.unknown && op > 0.005) {
         const bg = backgroundBehind(n);
         if (bg && !bg.unknown) {
-          const a = Math.min(1, fg.alpha * (n.opacity === undefined ? 1 : n.opacity));
+          const a = Math.min(1, fg.alpha * op);
           const eff = blendOver(fg.color, a, bg.color);
           const ratio = contrastRatio(eff, bg.color);
           const large = size >= 24 || (size >= 18.66 && weight >= 700);
           const need = large ? 3 : 4.5, aaa = large ? 4.5 : 7;
-          items.push({ id: n.id, name: String(n.characters).slice(0, 40), kind: 'contrast', status: ratio >= need ? 'pass' : 'fail', ratio: round(ratio, 2), need: need, aaa: ratio >= aaa, large: large,
-            fg: colorHex(eff), bg: colorHex(bg.color), assumed: bg.assumed, size: size });
-        } else items.push({ id: n.id, name: String(n.characters).slice(0, 40), kind: 'contrast', status: 'unknown', detail: 'Background is a ' + String(bg && bg.unknown || 'gradient/image').toLowerCase() + ' — check contrast manually' });
+          const faded = op < 0.995;
+          push({ rule: A11Y_RULE.contrast, id: n.id, name: String(n.characters).slice(0, 40), kind: 'contrast', status: ratio >= need ? 'pass' : 'fail', ratio: round(ratio, 2), need: need, aaa: ratio >= aaa, large: large,
+            fg: colorHex(eff), bg: colorHex(bg.color), assumed: bg.assumed, confidence: bg.assumed ? 'assumed' : 'measured', opacity: round(op, 2), size: size,
+            detail: faded ? 'Reduced to ' + Math.round(op * 100) + '% opacity by a parent layer' : '' });
+        } else push({ rule: A11Y_RULE.contrast, id: n.id, name: String(n.characters).slice(0, 40), kind: 'contrast', status: 'unknown', confidence: 'unknown', detail: 'Background is a ' + String(bg && bg.unknown || 'gradient/image').toLowerCase() + ' — check contrast manually' });
       }
-      if (size < 12) items.push({ id: n.id, name: String(n.characters).slice(0, 40), kind: 'size', status: 'warn', detail: 'Text is ' + round(size, 1) + 'px — under 12px is hard to read' });
+      if (size < 12) push({ rule: A11Y_RULE.size, id: n.id, name: String(n.characters).slice(0, 40), kind: 'size', status: 'warn', confidence: 'measured', detail: 'Text is ' + round(size, 1) + 'px — under 12px is hard to read' });
+      const lvl = headingLevel(size, weight);
+      if (lvl) headings.push({ level: lvl, id: n.id, name: String(n.characters).slice(0, 40), size: size });
     }
+
+    // Images need an alternative; a layer name is the only signal a plugin has.
+    if (n !== root && hasImageFill(n) && !isIconLike(n) && !inIconContext(n)) {
+      const alt = altDecision(n);
+      push({ rule: A11Y_RULE.alt, id: n.id, name: n.name, kind: 'alt', status: alt.status, confidence: 'inferred', detail: alt.detail });
+    }
+
+    // Icons and control outlines must reach 3:1 against what is behind them.
+    const iconLike = n !== root && isIconLike(n);
+    const outline = !iconLike && n !== root && isInteractive(n) && topSolid(n.strokes);
+    if (iconLike || outline) {
+      const fg = iconLike ? firstSolidPaint(n) : topSolid(n.strokes);
+      if (fg && !fg.unknown) {
+        const bg = backgroundBehind(n);
+        const op = effectiveOpacity(n);
+        if (bg && !bg.unknown && op > 0.005) {
+          const eff = blendOver(fg.color, Math.min(1, fg.alpha * op), bg.color);
+          const ratio = contrastRatio(eff, bg.color);
+          push({ rule: A11Y_RULE.nonText, id: n.id, name: n.name, kind: 'nontext', status: ratio >= 3 ? 'pass' : 'fail', ratio: round(ratio, 2), need: 3,
+            fg: colorHex(eff), bg: colorHex(bg.color), assumed: bg.assumed, confidence: bg.assumed ? 'assumed' : 'measured',
+            detail: (iconLike ? 'Icon' : 'Control outline') + ' contrast against the layer behind it' });
+        } else push({ rule: A11Y_RULE.nonText, id: n.id, name: n.name, kind: 'nontext', status: 'unknown', confidence: 'unknown', detail: 'Background is a ' + String(bg && bg.unknown || 'gradient/image').toLowerCase() + ' — check the 3:1 requirement manually' });
+      }
+    }
+
+    // A field with no visible label is unusable with a screen reader.
+    if (n !== root && /^(FRAME|INSTANCE|COMPONENT)$/.test(n.type) && FIELD_NAME_RE.test(n.name || '')) {
+      const labelled = hasVisibleText(n);
+      if (!labelled) push({ rule: A11Y_RULE.form, id: n.id, name: n.name, kind: 'form', status: 'warn', confidence: 'inferred', detail: 'Field has no visible label — pair it with a text label or a placeholder that survives' });
+      else push({ rule: A11Y_RULE.form, id: n.id, name: n.name, kind: 'form', status: 'pass', confidence: 'inferred', detail: 'Field has visible text' });
+    }
+
     if (n !== root && isInteractive(n) && 'width' in n) {
       const w = n.width, h = n.height, min = Math.min(w, h), mobile = frameWidth(n) <= 600;
-      if (min < 24) items.push({ id: n.id, name: n.name, kind: 'target', status: 'fail', w: round(w), h: round(h), detail: round(w) + '×' + round(h) + ' is under the 24×24 minimum (WCAG 2.5.8)' });
-      else if (mobile && min < 44) items.push({ id: n.id, name: n.name, kind: 'target', status: 'warn', w: round(w), h: round(h), detail: round(w) + '×' + round(h) + ' — aim for 44×44 on touch screens' });
-      else items.push({ id: n.id, name: n.name, kind: 'target', status: 'pass', w: round(w), h: round(h), detail: round(w) + '×' + round(h) });
-      let hasText = true;
-      try { hasText = !!(n.findOne && n.findOne(x => x.type === 'TEXT' && x.visible !== false && String(x.characters || '').trim())); } catch (e) { /* assume labelled */ }
-      if (!hasText && 'children' in n) items.push({ id: n.id, name: n.name, kind: 'label', status: 'warn', detail: 'No visible text — give it an accessible name (aria-label / contentDescription)' });
+      if (min < 24) push({ rule: A11Y_RULE.target, id: n.id, name: n.name, kind: 'target', status: 'fail', confidence: 'measured', w: round(w), h: round(h), detail: round(w) + '×' + round(h) + ' is under the 24×24 minimum (WCAG 2.5.8)' });
+      else if (mobile && min < 44) push({ rule: A11Y_RULE.target, id: n.id, name: n.name, kind: 'target', status: 'warn', confidence: 'measured', w: round(w), h: round(h), detail: round(w) + '×' + round(h) + ' — aim for 44×44 on touch screens' });
+      else push({ rule: A11Y_RULE.target, id: n.id, name: n.name, kind: 'target', status: 'pass', confidence: 'measured', w: round(w), h: round(h), detail: round(w) + '×' + round(h) });
+      if (!hasVisibleText(n)) push({ rule: A11Y_RULE.label, id: n.id, name: n.name, kind: 'label', status: 'warn', confidence: 'inferred', detail: 'No visible text — give it an accessible name (aria-label / contentDescription)' });
     }
-    if ('children' in n) n.children.forEach(visit);
+    if ('children' in n) n.children.forEach(c => visit(c, depth + 1));
   };
-  visit(root);
-  const counts = { fail: 0, warn: 0, pass: 0, unknown: 0 };
+  visit(root, 0);
+
+  // Document order is the only order a screen reader sees, so a skipped level is a
+  // real navigation problem — not a cosmetic one. Levels come from the type scale.
+  let prev = 0;
+  headings.forEach(h => {
+    if (prev && h.level > prev + 1) {
+      push({ rule: A11Y_RULE.heading, id: h.id, name: h.name, kind: 'heading', status: 'warn', confidence: 'inferred',
+        detail: 'Heading levels jump from ' + prev + ' to ' + h.level + ' (' + round(h.size, 1) + 'px) — do not skip levels' });
+    }
+    prev = h.level;
+  });
+
+  const counts = { fail: 0, warn: 0, pass: 0, unknown: 0, ignored: ignoredItems.length };
   items.forEach(i => { counts[i.status]++; });
   const order = { fail: 0, warn: 1, unknown: 2, pass: 3 };
   items.sort((a, b) => order[a.status] - order[b.status]);
@@ -2963,12 +3684,12 @@ function a11yAudit(root, limit) {
   const groups = [];
   const byKey = {};
   items.forEach(it => {
-    const key = it.kind === 'contrast' && it.status !== 'unknown'
-      ? ['c', it.status, it.fg, it.bg, it.ratio, it.need, it.large ? 1 : 0, it.assumed ? 1 : 0].join('|')
-      : [it.kind, it.status, it.detail || ''].join('|');
+    const key = (it.kind === 'contrast' || it.kind === 'nontext') && it.status !== 'unknown'
+      ? [it.kind, it.status, it.fg, it.bg, it.ratio, it.need, it.large ? 1 : 0, it.assumed ? 1 : 0].join('|')
+      : [it.kind, it.status, it.detail || '', it.need || ''].join('|');
     const g = byKey[key];
     if (!g) {
-      byKey[key] = { key: key, kind: it.kind, status: it.status, count: 1, ids: [it.id], item: it };
+      byKey[key] = { key: key, rule: it.rule, kind: it.kind, status: it.status, count: 1, ids: [it.id], item: it };
       groups.push(byKey[key]);
       return;
     }
@@ -2976,7 +3697,82 @@ function a11yAudit(root, limit) {
     if (g.ids.length < 50) g.ids.push(it.id);
   });
   groups.sort((a, b) => order[a.status] - order[b.status] || b.count - a.count);
-  return { items: items.slice(0, 120), groups: groups.slice(0, 120), counts: counts, scanned: scanned, limited: limited };
+  const byRule = {};
+  items.forEach(i => { byRule[i.rule] = (byRule[i.rule] || 0) + (i.status === 'fail' ? 1 : 0); });
+  const ignoredGroups = {};
+  ignoredItems.forEach(i => {
+    ignoredGroups[i.id] = ignoredGroups[i.id] || { id: i.id, name: i.name, reason: i.reason, kinds: [], rules: [] };
+    ignoredGroups[i.id].kinds.push(i.kind);
+    if (ignoredGroups[i.id].rules.indexOf(i.rule) < 0) ignoredGroups[i.id].rules.push(i.rule);
+  });
+  return {
+    items: items.slice(0, 120), groups: groups.slice(0, 120), counts: counts, byRule: byRule,
+    scanned: scanned, limited: limited, depthLimited: depthLimited,
+    ignored: Object.keys(ignoredGroups).map(k => ignoredGroups[k]).slice(0, 60),
+    headingLevels: headings.slice(0, 40).map(h => h.level),
+    reasons: A11Y_REASONS
+  };
+}
+
+/** Markdown or CSV export of an audit, including the review decisions. */
+function a11yReport(audit, format, meta) {
+  const a = audit || { groups: [], counts: { fail: 0, warn: 0, pass: 0, unknown: 0, ignored: 0 }, byRule: {}, scanned: 0 };
+  const c = a.counts || {};
+  // Layer names are user data: a newline or a stray pipe would break the table.
+  const flat = v => String(v == null ? '' : v).replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const title = flat(meta && meta.name) || 'Design';
+  const when = new Date().toISOString().slice(0, 10);
+  const groups = (a.groups || []).filter(g => g.status !== 'pass');
+  if (format === 'csv') {
+    const esc = v => '"' + String(v == null ? '' : v).replace(/"/g, '""').replace(/[\r\n\t]+/g, ' ') + '"';
+    const rows = [['status', 'rule', 'kind', 'layers', 'name', 'detail'].map(esc).join(',')];
+    groups.forEach(g => rows.push([g.status, g.rule, g.kind, g.count, (g.item && g.item.name) || '', (g.item && g.item.detail) || (g.item && g.item.ratio ? g.item.ratio + ':1' : '')].map(esc).join(',')));
+    (a.ignored || []).forEach(i => rows.push(['ignored', '', i.kinds.join(' '), 1, i.name, i.reason].map(esc).join(',')));
+    return { format: 'csv', text: rows.join('\n') + '\n', file: 'devready-a11y-' + slug(title) + '.csv' };
+  }
+  const lines = [];
+  lines.push('# Accessibility report — ' + title);
+  lines.push('');
+  lines.push('Generated by DevReady on ' + when + '. WCAG 2.2 AA.');
+  lines.push('');
+  lines.push('| | Count |');
+  lines.push('|---|---|');
+  lines.push('| Failing | ' + (c.fail || 0) + ' |');
+  lines.push('| To review | ' + (c.warn || 0) + ' |');
+  lines.push('| Unmeasured | ' + (c.unknown || 0) + ' |');
+  lines.push('| Passing | ' + (c.pass || 0) + ' |');
+  lines.push('| Ignored with a reason | ' + (c.ignored || 0) + ' |');
+  lines.push('| Layers checked | ' + (a.scanned || 0) + ' |');
+  lines.push('');
+  const rules = Object.keys(A11Y_RULE_TITLE).filter(r => (a.byRule || {})[r]);
+  if (rules.length) {
+    lines.push('## By rule');
+    lines.push('');
+    lines.push('| Rule | Criterion | Failures |');
+    lines.push('|---|---|---|');
+    rules.forEach(r => lines.push('| ' + r + ' | ' + A11Y_RULE_TITLE[r] + ' | ' + a.byRule[r] + ' |'));
+    lines.push('');
+  }
+  lines.push('## Findings');
+  lines.push('');
+  if (!groups.length) lines.push('No failing or reviewable findings.');
+  groups.forEach(g => {
+    const it = g.item || {};
+    lines.push('- **' + g.status.toUpperCase() + '** · WCAG ' + (g.rule || '—') + ' · ' + g.kind + (g.count > 1 ? ' · ' + g.count + ' layers' : ''));
+    lines.push('  - ' + (flat(it.name) || 'layer') + (it.detail ? ' — ' + flat(it.detail) : ''));
+  });
+  if ((a.ignored || []).length) {
+    lines.push('');
+    lines.push('## Ignored');
+    lines.push('');
+    // The criterion stays attached to the decision, so the exemption can be audited later.
+    a.ignored.forEach(i => lines.push('- ' + (flat(i.name) || 'layer') + ' — ' + (flat(i.reason) || 'no reason given') + ' (' + i.kinds.join(', ') + ((i.rules || []).length ? ' · WCAG ' + i.rules.join(', ') : '') + ')'));
+  }
+  lines.push('');
+  lines.push('---');
+  lines.push('');
+  lines.push('Checked ' + (a.scanned || 0) + ' layers' + (a.limited ? ', stopped at the layer limit' : '') + (a.depthLimited ? ', deeper layers skipped' : '') + '. Contrast includes opacity inherited from parent layers. Backgrounds that cannot be measured are reported as unmeasured, never as a pass.');
+  return { format: 'md', text: lines.join('\n') + '\n', file: 'devready-a11y-' + slug(title) + '.md' };
 }
 
 /* ------------------------------------------------------------------ */
@@ -2989,30 +3785,58 @@ function safeVarName(web, path) {
   const m = web && /var\((--[A-Za-z0-9_-]+)/.exec(web);
   return m ? m[1] : '--' + cssIdent(path);
 }
+/**
+ * Walks alias → alias → … so a token can fall back to the first target that is
+ * actually part of the export. A single-step lookup produced `var(--x)` for `--x`
+ * that belonged to a hidden variable or another file — valid CSS naming an
+ * undefined custom property, which renders as nothing.
+ */
+async function aliasChain(raw, modeId) {
+  const names = [];
+  let cur = raw;
+  for (let depth = 0; depth < 8; depth++) {
+    if (!cur || typeof cur !== 'object' || cur.type !== 'VARIABLE_ALIAS') break;
+    let v = null;
+    try { v = await figma.variables.getVariableByIdAsync(cur.id); } catch (e) { /* unavailable target */ }
+    if (!v) return names; // the target lives outside this file: chain stops here
+    names.push(v.name);
+    const coll = await getColl(v.variableCollectionId);
+    const mid = v.valuesByMode[modeId] !== undefined ? modeId : coll ? coll.defaultModeId : Object.keys(v.valuesByMode || {})[0];
+    cur = v.valuesByMode[mid];
+  }
+  return names;
+}
 async function tokenFromVariable(v) {
   const coll = await getColl(v.variableCollectionId);
-  const modes = coll ? coll.modes : [{ modeId: Object.keys(v.valuesByMode)[0], name: 'Default' }];
-  const defId = coll ? coll.defaultModeId : modes[0].modeId;
+  const fallbackMode = Object.keys(v.valuesByMode || {})[0];
+  const modes = coll && coll.modes && coll.modes.length ? coll.modes : [{ modeId: fallbackMode, name: 'Default' }];
+  const defId = (coll && coll.defaultModeId) || modes[0].modeId;
   const path = String(v.name).split('/').map(s => s.trim()).filter(Boolean);
-  const tok = { source: 'variable', name: v.name, path: path, type: v.resolvedType, collection: coll ? coll.name : '', description: v.description || '', web: (v.codeSyntax && v.codeSyntax.WEB) || '', modes: [] };
+  const tok = { source: 'variable', name: v.name, path: path, type: v.resolvedType, collection: coll ? coll.name : '', remote: !!(coll && coll.remote), description: v.description || '', web: (v.codeSyntax && v.codeSyntax.WEB) || '', modes: [] };
   for (const m of modes) {
     const raw = v.valuesByMode[m.modeId];
     const r = await resolveVarValue(raw, m.modeId, 0);
-    let ref = null;
-    if (raw && typeof raw === 'object' && raw.type === 'VARIABLE_ALIAS') {
-      try { const t = await figma.variables.getVariableByIdAsync(raw.id); ref = t ? t.name : null; } catch (e) { /* ignore */ }
-    }
-    tok.modes.push({ name: m.name, isDefault: m.modeId === defId, value: r.value, ref: ref });
+    const chain = raw && typeof raw === 'object' && raw.type === 'VARIABLE_ALIAS' ? await aliasChain(raw, m.modeId) : [];
+    const mode = { name: m.name, isDefault: m.modeId === defId, value: r.value, ref: chain.length ? chain[0] : null };
+    if (chain.length > 1) mode.refChain = chain;
+    if (r.cycle) mode.cycle = true;
+    if (r.value === null || r.value === undefined) mode.unresolved = true;
+    tok.modes.push(mode);
   }
   return tok;
 }
 function walkTree(node, fn, limit) {
   let n = 0;
-  (function go(x) { if (n++ >= limit) return; fn(x); if ('children' in x) x.children.forEach(go); })(node);
+  (function go(x, depth) {
+    if (n++ >= limit || depth > MAX_DEPTH) return;
+    fn(x);
+    if ('children' in x) x.children.forEach(c => go(c, depth + 1));
+  })(node, 0);
 }
 async function gatherTokens(scope, node) {
   const tokens = [];
   const seen = {};
+  let libraryCount = 0;
   const add = async v => {
     if (!v || seen[v.id] || v.hiddenFromPublishing) return;
     seen[v.id] = 1;
@@ -3025,8 +3849,28 @@ async function gatherTokens(scope, node) {
     for (const id of Object.keys(ctx.varIds)) { let v = null; try { v = await figma.variables.getVariableByIdAsync(id); } catch (e) { /* remote */ } await add(v); }
   } else {
     let list = [];
-    try { list = await figma.variables.getLocalVariablesAsync(); } catch (e) { /* unavailable */ }
+    try { list = await figma.variables.getLocalVariablesAsync(); } catch (e) { diag('local variables', e); }
     for (const v of list.slice(0, 2000)) await add(v);
+    // A design system usually lives in a library: those variables are part of the
+    // file's tokens even though the file does not own them. Bounded, and silently
+    // skipped on Figma builds without the API.
+    let library = 0;
+    const lib = figma.variables.getVariablesInLibraryCollectionAsync;
+    if (lib) {
+      let colls = [];
+      try { colls = await figma.variables.getAvailableLibraryVariableCollectionsAsync(); } catch (e) { diag('library collections', e); }
+      for (const c of (colls || []).slice(0, 8)) {
+        if (!c) continue;
+        let vars = [];
+        try { vars = await lib.call(figma.variables, c.key || c.id); } catch (e) { diag('library variables', e); }
+        for (const v of (vars || []).slice(0, 600)) {
+          if (library >= 500) break;
+          await add(v);
+          library++;
+        }
+      }
+    }
+    libraryCount = library;
   }
   const styles = { paint: [], text: [] };
   if (scope !== 'selection') {
@@ -3046,10 +3890,23 @@ async function gatherTokens(scope, node) {
       });
     } catch (e) { /* unavailable */ }
   }
-  return { tokens: tokens, styles: styles };
+  return { tokens: tokens, styles: styles, library: libraryCount };
 }
-function tokenValue(tok, mode, nameOf, unit, base) {
-  if (mode.ref) return 'var(' + nameOf(mode.ref) + ')';
+/**
+ * Name to reference for an aliased value, or '' when no target in the chain is
+ * part of this export (then the literal value is written instead).
+ */
+function refName(mode, nameOf, known) {
+  const chain = mode.refChain || (mode.ref ? [mode.ref] : []);
+  for (const n of chain) {
+    if (!n) continue;
+    if (!known || known(n)) return nameOf(n);
+  }
+  return '';
+}
+function tokenValue(tok, mode, nameOf, unit, base, known) {
+  const ref = refName(mode, nameOf, known);
+  if (ref) return 'var(' + ref + ')';
   const hint = tok.type === 'FLOAT' && !UNITLESS_RE.test(tok.name) ? 'px' : '';
   if (tok.type === 'STRING') return mode.value === null || mode.value === undefined ? null : cssStr(mode.value);
   const v = varValueCss(mode.value, tok.type, hint);
@@ -3081,8 +3938,9 @@ function jsonSet(root, path, leaf) {
   const last = path[path.length - 1];
   o[o[last] && o[last].$value === undefined && o[last] ? last + '-default' : last] = leaf;
 }
-function jsonValue(tok, mode, unit, base, refPath) {
-  if (mode.ref) return '{' + refPath(mode.ref) + '}';
+function jsonValue(tok, mode, unit, base, refPath, known) {
+  const ref = refName(mode, refPath, known);
+  if (ref) return '{' + ref + '}';
   if (tok.type === 'COLOR') return varValueCss(mode.value, 'COLOR');
   if (tok.type === 'FLOAT') return UNITLESS_RE.test(tok.name) ? mode.value : remify(round(mode.value, 2) + 'px', unit, base);
   return mode.value;
@@ -3095,9 +3953,17 @@ async function buildTokens(format, scope, node, unit, base) {
   const nameOf = format === 'tailwind'
     ? n => byName[n] ? twName(byName[n]) : '--' + cssIdent(String(n).split('/'))
     : n => byName[n] ? safeVarName(byName[n].web, byName[n].path) : '--' + cssIdent(String(n).split('/'));
-  const when = scope === 'selection' ? 'tokens used by the selection' : 'all local variables and styles';
-  const stats = { variables: toks.length, styles: data.styles.paint.length + data.styles.text.length, modes: 0 };
-  const head = 'Design tokens — exported from Figma by DevReady (' + when + ')';
+  // An alias may only become `var(--x)` / `{x.y}` when `--x` is in this export.
+  const known = n => !!(byName[n] && byName[n].path && byName[n].path.length);
+  const aliases = toks.filter(t => t.modes.some(m => m.ref)).length;
+  const unresolved = toks.filter(t => t.modes.some(m => m.unresolved)).length;
+  const library = data.library || 0;
+  const when = scope === 'selection'
+    ? 'tokens used by the selection'
+    : 'all local variables and styles' + (library ? ' plus ' + library + ' published library variable' + (library === 1 ? '' : 's') : '');
+  const stats = { variables: toks.length, styles: data.styles.paint.length + data.styles.text.length, modes: 0, aliases: aliases, library: library, unresolved: unresolved };
+  const head = 'Design tokens — exported from Figma by DevReady (' + when + ')' +
+    (unresolved ? ' · ' + unresolved + ' token' + (unresolved === 1 ? '' : 's') + ' could not be resolved in this file' : '');
   let text;
   const modeNames = {};
   toks.forEach(t => t.modes.forEach(m => { if (!m.isDefault) modeNames[t.collection + '|' + m.name] = 1; }));
@@ -3109,13 +3975,18 @@ async function buildTokens(format, scope, node, unit, base) {
     toks.forEach(t => {
       const def = t.modes.find(m => m.isDefault) || t.modes[0];
       if (!def || !t.path.length) return;
-      const v = jsonValue(t, def, unit, base, refPath);
-      if (v === null || v === undefined) return;
+      const v = jsonValue(t, def, unit, base, refPath, known);
+      if (v === null || v === undefined) {
+        // Value could not be resolved (remote variable the file cannot read).
+        // Keep the token so the consumer sees it exists, flagged rather than missing.
+        jsonSet(root, t.path, { $type: 'string', $value: null, $description: t.description || 'Unresolved in Figma — read the variable in the design file.' });
+        return;
+      }
       const leaf = { $type: t.type === 'COLOR' ? 'color' : t.type === 'FLOAT' ? (UNITLESS_RE.test(t.name) ? 'number' : 'dimension') : 'string', $value: v };
       if (t.description) leaf.$description = t.description;
       const others = t.modes.filter(m => !m.isDefault);
       leaf.$extensions = { 'com.figma': { collection: t.collection } };
-      if (others.length) { leaf.$extensions['com.figma'].modes = {}; others.forEach(m => { const mv = jsonValue(t, m, unit, base, refPath); if (mv !== null && mv !== undefined) leaf.$extensions['com.figma'].modes[m.name] = mv; }); }
+      if (others.length) { leaf.$extensions['com.figma'].modes = {}; others.forEach(m => { const mv = jsonValue(t, m, unit, base, refPath, known); if (mv !== null && mv !== undefined) leaf.$extensions['com.figma'].modes[m.name] = mv; }); }
       jsonSet(root, t.path, leaf);
     });
     data.styles.paint.forEach(s => { if (s.path.length) jsonSet(root, ['style'].concat(s.path), { $type: 'color', $value: varValueCss(s.color, 'COLOR') }); });
@@ -3134,12 +4005,12 @@ async function buildTokens(format, scope, node, unit, base) {
     toks.forEach(t => {
       const def = t.modes.find(m => m.isDefault) || t.modes[0];
       if (!def) return;
-      const v = tokenValue(t, def, n => sn(n), unit, base);
+      const v = tokenValue(t, def, n => sn(n), unit, base, known);
       if (v === null) return;
       const name = sn(t.name);
       lines.push(name + ': ' + v.replace(/var\((\$[^)]+)\)/g, '$1') + ';');
       t.modes.filter(m => !m.isDefault).forEach(m => {
-        const mv = tokenValue(t, m, n => sn(n), unit, base);
+        const mv = tokenValue(t, m, n => sn(n), unit, base, known);
         if (mv !== null && mv !== v) lines.push(name + '--' + slug(m.name) + ': ' + mv.replace(/var\((\$[^)]+)\)/g, '$1') + ';');
       });
     });
@@ -3162,11 +4033,11 @@ async function buildTokens(format, scope, node, unit, base) {
       const def = t.modes.find(m => m.isDefault) || t.modes[0];
       if (!def) return;
       const name = nameOf(t.name);
-      const v = tokenValue(t, def, nameOf, unit, base);
+      const v = tokenValue(t, def, nameOf, unit, base, known);
       if (v === null) return;
       root.push('  ' + name + ': ' + v + ';');
       t.modes.filter(m => !m.isDefault).forEach(m => {
-        const mv = tokenValue(t, m, nameOf, unit, base);
+        const mv = tokenValue(t, m, nameOf, unit, base, known);
         if (mv === null || mv === v) return;
         const sel = themeSelector(t.collection, m.name, t.modes);
         (themes[sel] = themes[sel] || []).push('  ' + name + ': ' + mv + ';');
@@ -3194,6 +4065,358 @@ async function buildTokens(format, scope, node, unit, base) {
   }
   const ext = format === 'json' ? 'json' : format === 'scss' ? 'scss' : 'css';
   return { text: text, file: (format === 'tailwind' ? 'theme' : 'tokens') + '.' + ext, lang: format === 'json' ? 'json' : 'css', stats: stats, empty: !toks.length && !stats.styles };
+}
+
+/* ------------------------------------------------------------------ */
+/* GitHub - optional, token-based, user-initiated only                 */
+/*                                                                     */
+/* A Figma plugin has no server, so an OAuth client secret cannot be   */
+/* kept: the safest supported flow is a fine-grained personal access   */
+/* token with "Contents: read and write" on the chosen repositories.    */
+/* The token lives in clientStorage on this machine, is attached to     */
+/* requests here in the plugin thread, and is never sent to the panel,  */
+/* written to the document, or included in generated code or logs.      */
+/* ------------------------------------------------------------------ */
+const GH_API = 'https://api.github.com';
+const GH_TIMEOUT_MS = 20000;
+let ghTokenCache;
+let ghTokenLoaded = false;
+
+async function ghToken() {
+  if (ghTokenLoaded) return ghTokenCache || null;
+  ghTokenLoaded = true;
+  try {
+    const t = await figma.clientStorage.getAsync('devready-github-token');
+    ghTokenCache = typeof t === 'string' && t ? t : null;
+  } catch (e) { ghTokenCache = null; diag('GitHub token', e); }
+  return ghTokenCache;
+}
+async function ghSetToken(t) {
+  ghTokenCache = t || null;
+  ghTokenLoaded = true;
+  try {
+    if (t) await figma.clientStorage.setAsync('devready-github-token', t);
+    else await figma.clientStorage.deleteAsync('devready-github-token');
+  } catch (e) { diag('GitHub token', e); }
+}
+/** Belt and braces: no token-shaped string ever leaves this module. */
+function ghScrub(text) {
+  let out = String(text == null ? '' : text);
+  if (ghTokenCache) out = out.split(ghTokenCache).join('[redacted]');
+  out = out.replace(/\b(?:gh[pousr]_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{10,})\b/g, '[redacted]');
+  return out.slice(0, 300);
+}
+function ghErrorOf(status, body, headers) {
+  const msg = body && body.message ? String(body.message) : '';
+  const remaining = headers && headers['x-ratelimit-remaining'];
+  const reset = headers && headers['x-ratelimit-reset'];
+  if (status === 0) return { code: 'network', message: msg || 'Could not reach GitHub. Check your connection and try again.' };
+  if (status === 401) return { code: 'auth', message: 'GitHub rejected the token. It may have expired or been revoked — reconnect GitHub.' };
+  if (status === 403 && String(remaining) === '0') {
+    const when = reset ? new Date(+reset * 1000).toLocaleTimeString() : 'later';
+    return { code: 'rate-limit', message: 'GitHub rate limit reached. Try again after ' + when + '.' };
+  }
+  if (status === 403) return { code: 'permission', message: 'The token cannot do that. It needs "Contents: read and write" (and "Administration: write" to create repositories).' };
+  if (status === 404) return { code: 'not-found', message: msg || 'Not found — or the token cannot see this repository.' };
+  if (status === 409 || status === 422) return { code: 'conflict', message: msg || 'The branch moved while committing. Refresh the changes and try again.' };
+  if (status >= 500) return { code: 'unavailable', message: 'GitHub is unavailable right now (' + status + '). Try again in a moment.' };
+  return { code: 'http-' + status, message: msg || ('GitHub returned ' + status + '.') };
+}
+
+function ghWithTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const timer = setTimeout(() => { if (!done) { done = true; reject({ code: 'timeout', message: 'GitHub did not answer within ' + Math.round(ms / 1000) + ' s.' }); } }, ms);
+    promise.then(v => { if (!done) { done = true; clearTimeout(timer); resolve(v); } },
+      e => { if (!done) { done = true; clearTimeout(timer); reject(e); } });
+  });
+}
+
+/**
+ * One place where GitHub is called. Adds auth, version pinning, a timeout, a single
+ * retry for transient failures and uniform error mapping. Returns
+ * { ok, status, body, headers, rate, error } and never throws.
+ */
+async function ghRequest(path, opts) {
+  opts = opts || {};
+  if (typeof path !== 'string' || path[0] !== '/' || /[\s\u0000]/.test(path) || path.length > 400) {
+    return { ok: false, status: 0, error: { code: 'bad-path', message: 'Invalid GitHub request.' } };
+  }
+  const token = await ghToken();
+  if (!token) return { ok: false, status: 0, error: { code: 'not-connected', message: 'Connect GitHub first.' } };
+  const attempt = async () => {
+    const headers = {
+      'Accept': 'application/vnd.github+json',
+      'Authorization': 'Bearer ' + token,
+      'X-GitHub-Api-Version': '2022-11-28'
+    };
+    if (opts.body) headers['Content-Type'] = 'application/json';
+    const init = { method: opts.method || 'GET', headers: headers };
+    if (opts.body) init.body = JSON.stringify(opts.body);
+    const res = await ghWithTimeout(fetch(GH_API + path, init), GH_TIMEOUT_MS);
+    let text;
+    try { text = await res.text(); } catch (e) { /* empty body */ }
+    let body = null;
+    if (text) { try { body = JSON.parse(text); } catch (e) { body = null; } }
+    const headersOut = {};
+    ['x-ratelimit-remaining', 'x-ratelimit-reset', 'x-oauth-scopes'].forEach(k => {
+      try { if (res.headers && res.headers.get) headersOut[k] = res.headers.get(k); } catch (e) { /* ignore */ }
+    });
+    return { res: res, body: body, headers: headersOut };
+  };
+  let result;
+  try {
+    result = await attempt();
+  } catch (e) {
+    if (e && e.code === 'timeout') return { ok: false, status: 0, error: { code: 'timeout', message: ghScrub(e.message) } };
+    return { ok: false, status: 0, error: { code: 'network', message: ghScrub((e && e.message) || 'Could not reach GitHub.') } };
+  }
+  const status = result.res && typeof result.res.status === 'number' ? result.res.status : 0;
+  const ok = result.res && result.res.ok !== false && status >= 200 && status < 300;
+  // One retry for a transient server error on a read. Writes are never retried
+  // automatically: a retried commit can duplicate history.
+  if (!ok && (opts.method || 'GET') === 'GET' && status >= 500 && !opts.retried) {
+    await new Promise(r => setTimeout(r, 300));
+    return ghRequest(path, Object.assign({}, opts, { retried: true }));
+  }
+  return {
+    ok: ok, status: status, body: result.body, headers: result.headers,
+    rate: result.headers['x-ratelimit-remaining'], error: ok ? null : ghErrorOf(status, result.body, result.headers)
+  };
+}
+
+/* --- repository & account operations --- */
+
+async function ghStatus() {
+  const token = await ghToken();
+  if (!token) return { connected: false };
+  const r = await ghRequest('/user');
+  if (!r.ok) return { connected: false, stale: true, error: r.error };
+  const b = r.body || {};
+  return { connected: true, login: b.login, name: b.name || '', avatar: b.avatar_url || '', scopes: r.headers['x-oauth-scopes'] || '', rate: r.rate };
+}
+
+async function ghRepos() {
+  const r = await ghRequest('/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member');
+  if (!r.ok) return { ok: false, error: r.error };
+  const list = (Array.isArray(r.body) ? r.body : []).slice(0, 100).map(x => ({
+    fullName: x.full_name || '', private: !!x.private, defaultBranch: x.default_branch || 'main',
+    updatedAt: x.updated_at || '', description: x.description || '', empty: !x.size
+  }));
+  return { ok: true, repos: list };
+}
+
+async function ghBranches(repo) {
+  if (!GH_REPO_RE.test(String(repo))) return { ok: false, error: { code: 'bad-repo', message: 'Pick a repository first.' } };
+  const r = await ghRequest('/repos/' + repo + '/branches?per_page=100');
+  if (!r.ok) return { ok: false, error: r.error };
+  return { ok: true, branches: (Array.isArray(r.body) ? r.body : []).slice(0, 100).map(b => ({ name: b.name, sha: b.commit && b.commit.sha, protected: !!(b.protected) })) };
+}
+
+async function ghCreateRepo(opts) {
+  const name = String(opts && opts.name || '');
+  if (!GH_NAME_RE.test(name)) return { ok: false, error: { code: 'bad-name', message: 'Repository names may use letters, numbers, dot, dash and underscore.' } };
+  const body = { name: name, private: opts.private !== false, description: String(opts.description || '').slice(0, 200), auto_init: true };
+  const r = await ghRequest('/user/repos', { method: 'POST', body: body });
+  if (!r.ok) return { ok: false, error: r.error };
+  const b = r.body || {};
+  return { ok: true, repo: { fullName: b.full_name, defaultBranch: b.default_branch || 'main', private: !!b.private, url: b.html_url } };
+}
+
+/** Remote file list (paths only), for the commit preview. */
+/* ---------- git blob hashes ---------- */
+/**
+ * Git's object name for a file: SHA-1 of "blob <bytes>\0" + the UTF-8 content.
+ * With it the preview can say added / modified / unchanged exactly, and a push
+ * whose tree would be identical to the parent can be refused instead of creating
+ * an empty commit.
+ */
+function utf8Of(text) {
+  const out = [];
+  const str = String(text == null ? '' : text);
+  for (let i = 0; i < str.length; i++) {
+    let c = str.charCodeAt(i);
+    if (c < 0x80) out.push(c);
+    else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+      const low = str.charCodeAt(i + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        c = 0x10000 + ((c - 0xd800) << 10) + (low - 0xdc00);
+        i++;
+        out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+      } else out.push(0xef, 0xbf, 0xbd);
+    } else if (c >= 0xd800 && c <= 0xdfff) out.push(0xef, 0xbf, 0xbd);
+    else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+  }
+  return out;
+}
+function sha1Hex(bytes) {
+  const ml = bytes.length * 8;
+  const buf = bytes.slice();
+  buf.push(0x80);
+  while (buf.length % 64 !== 56) buf.push(0);
+  const hi = Math.floor(ml / 0x100000000), lo = ml >>> 0;
+  buf.push((hi >>> 24) & 255, (hi >>> 16) & 255, (hi >>> 8) & 255, hi & 255);
+  buf.push((lo >>> 24) & 255, (lo >>> 16) & 255, (lo >>> 8) & 255, lo & 255);
+  let h0 = 0x67452301, h1 = 0xefcdab89, h2 = 0x98badcfe, h3 = 0x10325476, h4 = 0xc3d2e1f0;
+  const w = new Array(80);
+  const rol = (n, k) => ((n << k) | (n >>> (32 - k))) >>> 0;
+  for (let i = 0; i < buf.length; i += 64) {
+    for (let j = 0; j < 16; j++) {
+      w[j] = (buf[i + j * 4] << 24) | (buf[i + j * 4 + 1] << 16) | (buf[i + j * 4 + 2] << 8) | buf[i + j * 4 + 3];
+    }
+    for (let j = 16; j < 80; j++) w[j] = rol(w[j - 3] ^ w[j - 8] ^ w[j - 14] ^ w[j - 16], 1);
+    let a = h0, b = h1, c = h2, d = h3, e = h4;
+    for (let j = 0; j < 80; j++) {
+      let f, k;
+      if (j < 20) { f = (b & c) | (~b & d); k = 0x5a827999; }
+      else if (j < 40) { f = b ^ c ^ d; k = 0x6ed9eba1; }
+      else if (j < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc; }
+      else { f = b ^ c ^ d; k = 0xca62c1d6; }
+      const t = (rol(a, 5) + (f >>> 0) + e + k + (w[j] >>> 0)) >>> 0;
+      e = d; d = c; c = rol(b, 30); b = a; a = t;
+    }
+    h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0; h4 = (h4 + e) >>> 0;
+  }
+  return [h0, h1, h2, h3, h4].map(h => ('00000000' + h.toString(16)).slice(-8)).join('');
+}
+function gitBlobSha(text) {
+  const body = utf8Of(text);
+  const head = utf8Of('blob ' + body.length + '\u0000');
+  return sha1Hex(head.concat(body));
+}
+
+async function ghRemoteFiles(repo, branch, local) {
+  if (!GH_REPO_RE.test(String(repo))) return { ok: false, error: { code: 'bad-repo', message: 'Pick a repository first.' } };
+  if (branch && !GH_BRANCH_RE.test(String(branch))) return { ok: false, error: { code: 'bad-branch', message: 'Invalid branch name.' } };
+  const ref = branch || 'HEAD';
+  const r = await ghRequest('/repos/' + repo + '/git/trees/' + encodeURIComponent(ref) + '?recursive=1');
+  // An empty repository (no commits yet) answers 404/409: that is a valid state,
+  // not a failure — everything local is then "added".
+  if (!r.ok && (r.status === 404 || r.status === 409)) {
+    // Empty repository: every local file is new, and nothing is deleted.
+    const fresh = (Array.isArray(local) ? local : [])
+      .filter(f => f && typeof f.path === 'string' && GH_PATH_RE.test(f.path))
+      .slice(0, GH_MAX_FILES)
+      .map(f => ({ path: f.path, status: 'added', sha: gitBlobSha(f.content) }));
+    return { ok: true, files: [], headSha: '', empty: true, truncated: false, local: fresh, deleted: [] };
+  }
+  if (!r.ok) return { ok: false, error: r.error };
+  const remote = {};
+  const blobs = (r.body && Array.isArray(r.body.tree) ? r.body.tree : []).filter(x => x.type === 'blob');
+  blobs.slice(0, 2000).forEach(x => { remote[x.path] = { sha: x.sha, size: x.size }; });
+  const head = branch ? await ghRef(repo, branch) : { ok: true, sha: '' };
+  const files = Object.keys(remote).map(path => ({ path: path, sha: remote[path].sha, size: remote[path].size }));
+  const out = { ok: true, files: files, headSha: (head && head.sha) || '', empty: false, truncated: !!(r.body && r.body.truncated) };
+
+  // Compare against the files the panel is about to send, when it sent them.
+  if (Array.isArray(local) && local.length) {
+    const mine = {};
+    local.slice(0, GH_MAX_FILES).forEach(f => {
+      if (!f || typeof f.path !== 'string' || !GH_PATH_RE.test(f.path)) return;
+      mine[f.path] = gitBlobSha(f.content);
+    });
+    out.local = Object.keys(mine).map(path => {
+      const known = remote[path];
+      return { path: path, status: !known ? 'added' : known.sha === mine[path] ? 'unchanged' : 'modified', sha: mine[path] };
+    });
+    out.deleted = Object.keys(remote).filter(path => mine[path] === undefined).map(path => ({ path: path, status: 'deleted', sha: remote[path].sha }));
+  }
+  return out;
+}
+
+async function ghDefaultBranch(repo) {
+  const r = await ghRequest('/repos/' + repo);
+  if (!r.ok) return { ok: false, error: r.error };
+  return { ok: true, branch: (r.body && r.body.default_branch) || 'main' };
+}
+
+async function ghRef(repo, branch) {
+  const r = await ghRequest('/repos/' + repo + '/git/ref/heads/' + encodeURIComponent(branch));
+  if (r.ok) return { ok: true, sha: r.body && r.body.object && r.body.object.sha, exists: true };
+  if (r.status === 404 || r.status === 409) return { ok: true, sha: null, exists: false };
+  return { ok: false, error: r.error };
+}
+
+/**
+ * Publish generated files as one commit.
+ *  1. resolve the branch head (optionally verifying the sha the panel previewed)
+ *  2. create blobs, a tree on top of the head, and a commit
+ *  3. move the branch with force:false, so a concurrent push is rejected, not lost
+ * Nothing is written until every blob exists, and a failed push leaves the branch
+ * untouched and retryable.
+ */
+async function ghCommit(job) {
+  const repo = String(job.repo || '');
+  const branch = String(job.branch || '');
+  const files = job.files || [];
+  if (!GH_REPO_RE.test(repo)) return { ok: false, error: { code: 'bad-repo', message: 'Pick a repository first.' } };
+  if (!GH_BRANCH_RE.test(branch) || branch.indexOf('..') > -1) return { ok: false, error: { code: 'bad-branch', message: 'Invalid branch name.' } };
+  if (!files.length) return { ok: false, error: { code: 'no-files', message: 'Nothing selected to commit.' } };
+  if (files.length > GH_MAX_FILES) return { ok: false, error: { code: 'too-many', message: 'Select at most ' + GH_MAX_FILES + ' files.' } };
+  let total = 0;
+  for (const f of files) {
+    if (!GH_PATH_RE.test(f.path)) return { ok: false, error: { code: 'bad-path', message: 'Unsafe file path: ' + String(f.path).slice(0, 120) } };
+    total += String(f.content || '').length;
+  }
+  if (total > GH_MAX_BYTES) return { ok: false, error: { code: 'too-large', message: 'The selected files are ' + Math.round(total / 1024) + ' kB; the limit is ' + Math.round(GH_MAX_BYTES / 1024) + ' kB.' } };
+
+  const head = await ghRef(repo, branch);
+  if (!head.ok) return { ok: false, error: head.error };
+  let parentSha = head.sha;
+  if (!head.exists) {
+    if (!job.createBranch) return { ok: false, error: { code: 'no-branch', message: 'Branch "' + branch + '" does not exist. Create it from the default branch first.' } };
+    const def = await ghDefaultBranch(repo);
+    if (!def.ok) return { ok: false, error: def.error };
+    const base = await ghRef(repo, def.branch);
+    if (!base.ok) return { ok: false, error: base.error };
+    parentSha = base.sha;
+    if (!parentSha) return { ok: false, error: { code: 'no-branch', message: 'The repository has no commits yet. Add a README on GitHub, then try again.' } };
+  }
+  // The panel previewed against a specific head; if it moved, stop before writing.
+  if (job.baseSha && head.exists && job.baseSha !== parentSha) {
+    return { ok: false, error: { code: 'conflict', message: 'The branch moved since you previewed these changes (' + String(parentSha).slice(0, 7) + '). Preview again to see the new state.' } };
+  }
+
+  const commitRes = await ghRequest('/repos/' + repo + '/git/commits/' + parentSha);
+  if (!commitRes.ok) return { ok: false, error: commitRes.error };
+  const baseTree = commitRes.body && commitRes.body.tree && commitRes.body.tree.sha;
+
+  const entries = [];
+  for (const f of files) {
+    if (f.del) {
+      // `sha: null` removes the path from the tree; no blob is written.
+      entries.push({ path: f.path, mode: '100644', type: 'blob', sha: null });
+      continue;
+    }
+    const blob = await ghRequest('/repos/' + repo + '/git/blobs', { method: 'POST', body: { content: f.content, encoding: 'utf-8' } });
+    if (!blob.ok) return { ok: false, error: blob.error, stage: 'blob', file: f.path };
+    entries.push({ path: f.path, mode: '100644', type: 'blob', sha: blob.body && blob.body.sha });
+  }
+  const tree = await ghRequest('/repos/' + repo + '/git/trees', { method: 'POST', body: { base_tree: baseTree, tree: entries } });
+  if (!tree.ok) return { ok: false, error: tree.error, stage: 'tree' };
+  if (tree.body && tree.body.sha && baseTree && tree.body.sha === baseTree) {
+    // Nothing would actually change: an empty commit is worse than an honest refusal.
+    return { ok: false, error: { code: 'no-changes', message: 'Every selected file already matches the repository — there is nothing to commit.' }, stage: 'tree' };
+  }
+  const commit = await ghRequest('/repos/' + repo + '/git/commits', {
+    method: 'POST',
+    body: { message: String(job.message || 'Update from DevReady').slice(0, 500), tree: tree.body && tree.body.sha, parents: [parentSha] }
+  });
+  if (!commit.ok) return { ok: false, error: commit.error, stage: 'commit' };
+  const sha = commit.body && commit.body.sha;
+
+  const moved = head.exists
+    ? await ghRequest('/repos/' + repo + '/git/refs/heads/' + encodeURIComponent(branch), { method: 'PATCH', body: { sha: sha, force: false } })
+    : await ghRequest('/repos/' + repo + '/git/refs', { method: 'POST', body: { ref: 'refs/heads/' + branch, sha: sha } });
+  if (!moved.ok) {
+    const err = moved.error;
+    // 422 on a non-forced ref update means the branch advanced underneath us.
+    if (moved.status === 422) return { ok: false, error: { code: 'conflict', message: 'Someone pushed to "' + branch + '" while committing. Nothing was overwritten — preview and try again.' }, stage: 'push' };
+    return { ok: false, error: err, stage: 'push' };
+  }
+  return { ok: true, sha: sha, branch: branch, repo: repo, files: files.length, created: !head.exists,
+    url: 'https://github.com/' + repo + '/commit/' + sha };
 }
 
 /* ---------- Prototype interactions ---------- */
@@ -3410,8 +4633,7 @@ if (figma.mode === 'codegen') {
       if (status) { const cont = await figma.getNodeByIdAsync(status.nodeId); const d = cont && diffBaseline(cont); if (d && d.count) header += ' · ⚠ ' + d.count + ' change' + (d.count > 1 ? 's' : '') + ' since ready'; }
     } catch (e) { /* ignore */ }
     const out = await generateCode(node, event.language, unit, base, 150, { inlineBudget: 400 * 1024, fastFonts: true });
-    const LANG = { html: 'HTML', vue: 'HTML', svelte: 'HTML', css: 'CSS', jsx: 'JAVASCRIPT', swift: 'SWIFT', kotlin: 'KOTLIN', dart: 'PLAINTEXT', text: 'PLAINTEXT' };
-    const res = out.files.map((f, i) => ({ title: (i === 0 ? header + '  ·  ' : '') + f.name, language: LANG[f.lang] || 'PLAINTEXT', code: f.code }));
+    const res = out.files.map((f, i) => ({ title: (i === 0 ? header + '  ·  ' : '') + f.name, language: CODEGEN_LANG[f.lang] || 'PLAINTEXT', code: f.code }));
     if (out.assets.length) res.push({ title: 'Assets (export from the DevReady panel → Download project)', language: 'PLAINTEXT', code: out.assets.map(a => 'assets/' + a.file + (a.scale > 1 ? '  (@' + a.scale + 'x)' : '')).join('\n') });
     return res;
   });
@@ -3430,8 +4652,10 @@ if (figma.mode === 'codegen') {
 
   async function refresh() {
     const my = ++reqId;
+    clearDiagnostics(); // notes describe this pass only
     const sel = figma.currentPage.selection;
-    const base = { editor: figma.editorType, isDev: IS_DEV, settings: settings };
+    const base = { editor: figma.editorType, isDev: IS_DEV, settings: settings,
+      limits: { maxDepth: MAX_DEPTH, snapLimit: SNAP_LIMIT, snapBytes: SNAP_BYTES, a11yLimit: 400, run: RUN_LIMITS } };
 
     if (!sel.length) {
       lastSegments = [];
@@ -3442,7 +4666,10 @@ if (figma.mode === 'codegen') {
 
     const node = sel[0];
     const status = findDevStatus(node);
-    const target = markTarget(node);
+    const targets = statusTargets(node);
+    // Where a status would go, and whether Figma itself can hold it. The panel
+    // uses this to explain why a group needs the DevReady flag instead.
+    const targetInfo = targets.flag ? { id: targets.flag.id, name: targets.flag.name, type: targets.flag.type, native: !!targets.native } : null;
 
     if (settings.gate === 'strict' && !status) {
       lastSegments = [];
@@ -3450,8 +4677,9 @@ if (figma.mode === 'codegen') {
       post(Object.assign({
         type: 'state', mode: 'locked',
         node: { id: node.id, name: node.name, type: node.type },
-        target: target ? { id: target.id, name: target.name, type: target.type } : null,
-        ready: listReady()
+        target: targetInfo,
+        ready: listReady(),
+        diagnostics: takeDiagnostics()
       }, base));
       return;
     }
@@ -3473,15 +4701,16 @@ if (figma.mode === 'codegen') {
       try {
         const cont = await figma.getNodeByIdAsync(status.nodeId);
         if (cont) changes = diffBaseline(cont) || { none: true, containerId: cont.id, containerName: cont.name };
-      } catch (e) { /* ignore */ }
+      } catch (e) { diag('change history', e); }
     }
     if (my !== reqId) return;
 
     let a11y = null;
-    try { a11y = a11yAudit(node, 400); } catch (e) { /* audit is best-effort */ }
+    try { a11y = a11yAudit(node, 400, await readA11yIgnore()); } catch (e) { diag('accessibility audit', e); }
     if (my !== reqId) return;
 
-    const assets = collectAssets(node, 60);
+    const assets = collectAssets(node, 120, settings.svgFrames);
+    const complexity = assessComplexity(node);
     // Include the selected node itself as the first asset row
     assets.unshift({ id: node.id, name: node.name, type: node.type, kind: 'selection', w: round(node.width), h: round(node.height) });
 
@@ -3489,14 +4718,16 @@ if (figma.mode === 'codegen') {
       type: 'state', mode: 'inspect',
       count: sel.length,
       status: status,
-      target: target ? { id: target.id, name: target.name, type: target.type } : null,
+      target: targetInfo,
       spec: spec,
       css: groupedCSS(css, settings.unit, settings.remBase, spec.text && spec.text.segments[0] ? spec.text.segments[0].styleName : null),
       tailwind: cssToTailwind(css, settings.unit, settings.remBase).join(' '),
       measure: measure,
       changes: changes,
       a11y: a11y,
-      assets: assets
+      assets: assets,
+      complexity: complexity,
+      diagnostics: takeDiagnostics()
     }, base));
 
     // Thumbnails (only when the selection itself changes, not on every edit)
@@ -3521,8 +4752,25 @@ if (figma.mode === 'codegen') {
     timer = setTimeout(() => { timer = null; refresh().catch(err => post({ type: 'error', message: String(err && err.message || err) })); }, typeof delay === 'number' ? delay : 120);
   }
 
+  // One listener per page, not one per page switch: without detaching, switching
+  // pages 30 times leaves 30 handlers running the same refresh.
+  let watchedPage = null;
+  let watchedHandler = null;
   function watchPage() {
-    try { figma.currentPage.on('nodechange', () => { Object.keys(diffCache).forEach(k => { diffCache[k] = null; }); schedule(400); }); } catch (e) { /* ignore */ }
+    try {
+      if (watchedPage && watchedHandler && typeof watchedPage.off === 'function') watchedPage.off('nodechange', watchedHandler);
+    } catch (e) { /* older Figma */ }
+    watchedPage = figma.currentPage;
+    watchedHandler = null;
+    try {
+      watchedHandler = function () {
+        // A variable/style rename or an edit inside a baseline container must be
+        // visible on the next refresh, so drop the lookup caches with the diffs.
+        clearLookupCaches();
+        schedule(400);
+      };
+      watchedPage.on('nodechange', watchedHandler);
+    } catch (e) { /* ignore */ }
   }
 
   figma.on('selectionchange', () => schedule(80));
@@ -3558,9 +4806,10 @@ if (figma.mode === 'codegen') {
         case 'mark': {
           const r = await setReady(msg.id, msg.status, msg.note);
           if (r.ok) {
-            figma.notify(msg.status
-              ? (r.native ? '🟢 "' + r.name + '" marked Ready for dev' : '🟢 "' + r.name + '" flagged ready (plugin flag)')
-              : '"' + r.name + '" status cleared');
+            if (msg.status) {
+              const label = r.name + (msg.status === 'COMPLETED' ? ' marked Completed' : ' marked Ready for dev');
+              figma.notify(r.native ? '🟢 ' + label : '🟢 ' + r.name + ' flagged ready (Figma status not available on this layer type or plan)');
+            } else figma.notify('"' + r.name + '" status cleared');
           } else figma.notify(r.error, { error: true });
           schedule();
           break;
@@ -3594,15 +4843,153 @@ if (figma.mode === 'codegen') {
         case 'gen-code': {
           const sel = figma.currentPage.selection;
           const node = msg.nodeId ? await figma.getNodeByIdAsync(msg.nodeId) : sel[0];
-          if (!node) break;
-          const out = await generateCode(node, msg.lang, settings.unit, settings.remBase, 600);
-          post({ type: 'code', lang: msg.lang, requestId: msg.requestId || '', nodeId: node.id, out: out });
+          // Always answer: a deleted layer used to leave the panel on "Building…"
+          // forever, because the request was never resolved either way.
+          if (!node) {
+            post({ type: 'code', lang: msg.lang, requestId: msg.requestId || '', nodeId: msg.nodeId || '', out: {
+              files: [{ name: 'error.txt', lang: 'text', code: 'That layer no longer exists — select another layer and try again.' }],
+              assets: [], fonts: [], preview: { w: 0, h: 0, inlinedKB: 0 }, truncated: false, assetErrors: [],
+              stats: { layers: 0, classes: 0, assets: 0, tokens: 0, modes: 0, mapped: 0 }
+            } });
+            break;
+          }
+          const job = { id: msg.jobId || 0, cancelled: false };
+          if (job.id) JOBS[job.id] = job;
+          let out;
+          try {
+            out = await generateCode(node, msg.lang, settings.unit, settings.remBase, 600, { job: job, svgFrames: settings.svgFrames });
+          } finally {
+            if (job.id) delete JOBS[job.id];
+          }
+          post({ type: 'code', lang: msg.lang, requestId: msg.requestId || '', nodeId: node.id, out: out, cancelled: !!out.cancelled });
+          break;
+        }
+        case 'cancel': {
+          const job = JOBS[msg.jobId];
+          if (job) job.cancelled = true;
+          break;
+        }
+        case 'thumb-request': {
+          // Thumbnails are small PNGs; the panel asks for the ones it actually shows.
+          try {
+            const n = await figma.getNodeByIdAsync(msg.id);
+            if (n && 'exportAsync' in n) {
+              const big = Math.max(n.width, n.height) || 1;
+              const bytes = await n.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: Math.min(4, 160 / big) } });
+              post({ type: 'thumb', id: n.id, bytes: bytes });
+            }
+          } catch (e) { diag('thumbnail', e); }
+          break;
+        }
+        case 'plan': {
+          // Cheap pre-flight for the panel: classification + cost, nothing generated.
+          const sel = figma.currentPage.selection.slice(0, 50);
+          const nodes = sel.map(n => {
+            const complexity = assessComplexity(n);
+            const illo = illustrationPlan(n, settings.svgFrames);
+            return {
+              id: n.id, name: n.name, type: n.type,
+              illustration: illo ? { reason: illo.reason, vectors: illo.vectors, nodes: illo.nodes } : null,
+              complexity: complexity
+            };
+          });
+          post({ type: 'plan', nodes: nodes, limits: RUN_LIMITS, svgFrames: settings.svgFrames });
+          break;
+        }
+        case 'a11y-ignore': {
+          const map = await readA11yIgnore();
+          msg.ids.forEach(id => { map[id] = msg.reason || 'Ignored'; });
+          const clean = writeA11yIgnore(map);
+          post({ type: 'a11y-ignored', ignored: Object.keys(clean).length });
+          figma.notify('Accessibility: ' + msg.ids.length + ' finding' + (msg.ids.length === 1 ? '' : 's') + ' ignored' + (msg.reason ? ' · ' + msg.reason : ''));
+          schedule();
+          break;
+        }
+        case 'a11y-unignore': {
+          const map = await readA11yIgnore();
+          msg.ids.forEach(id => { delete map[id]; });
+          const clean = writeA11yIgnore(map);
+          post({ type: 'a11y-ignored', ignored: Object.keys(clean).length });
+          schedule();
+          break;
+        }
+        case 'a11y-report': {
+          const node = figma.currentPage.selection[0];
+          let audit = null;
+          try { if (node) audit = a11yAudit(node, 400, await readA11yIgnore()); } catch (e) { diag('accessibility report', e); }
+          post({ type: 'a11y-report', format: msg.format, out: a11yReport(audit, msg.format, { name: node ? node.name : (figma.root.name || 'Design') }) });
+          break;
+        }
+        case 'store-get': {
+          post({ type: 'store', key: msg.key, value: await storeGet(msg.key) });
+          break;
+        }
+        case 'store-set': {
+          try {
+            await storeSet(msg.key, msg.value);
+            post({ type: 'store-ok', key: msg.key });
+          } catch (e) {
+            post({ type: 'store-error', key: msg.key, message: String((e && e.message) || e).slice(0, 200) });
+          }
+          break;
+        }
+        case 'gh-status': {
+          const st = await ghStatus();
+          post({ type: 'gh-status', status: st });
+          break;
+        }
+        case 'gh-connect': {
+          await ghSetToken(msg.token);
+          const st = await ghStatus();
+          if (!st.connected) {
+            await ghSetToken(null);
+            post({ type: 'gh-status', status: { connected: false, error: st.error || { code: 'auth', message: 'GitHub did not accept that token.' } } });
+            break;
+          }
+          figma.notify('GitHub connected as ' + st.login);
+          post({ type: 'gh-status', status: st });
+          break;
+        }
+        case 'gh-disconnect': {
+          await ghSetToken(null);
+          ghReposCache.length = 0;
+          figma.notify('GitHub disconnected — the token was removed from this machine');
+          post({ type: 'gh-status', status: { connected: false } });
+          break;
+        }
+        case 'gh-repos': {
+          const r = await ghRepos();
+          post({ type: 'gh-repos', ok: r.ok, repos: r.repos || [], error: r.error || null });
+          break;
+        }
+        case 'gh-branches': {
+          const r = await ghBranches(msg.repo);
+          post({ type: 'gh-branches', ok: r.ok, repo: msg.repo, branches: r.branches || [], error: r.error || null });
+          break;
+        }
+        case 'gh-create-repo': {
+          const r = await ghCreateRepo(msg);
+          post({ type: 'gh-created', ok: r.ok, repo: r.repo || null, error: r.error || null });
+          break;
+        }
+        case 'gh-tree': {
+          const r = await ghRemoteFiles(msg.repo, msg.branch, msg.files);
+          post({ type: 'gh-tree', ok: r.ok, repo: msg.repo, branch: msg.branch, files: r.files || [], local: r.local || [],
+            deleted: r.deleted || [], headSha: r.headSha || '', empty: !!r.empty, truncated: !!r.truncated, error: r.error || null });
+          break;
+        }
+        case 'gh-commit': {
+          const r = await ghCommit(msg);
+          if (r.ok) figma.notify('Pushed ' + r.files + ' file' + (r.files === 1 ? '' : 's') + ' to ' + r.repo + ' · ' + r.branch);
+          else figma.notify('GitHub: ' + r.error.message, { error: true });
+          post({ type: 'gh-committed', ok: r.ok, result: r.ok ? { sha: r.sha, url: r.url, branch: r.branch, files: r.files, created: r.created } : null, error: r.error || null, stage: r.stage || '' });
           break;
         }
         case 'tokens-export': {
           const sel = figma.currentPage.selection;
+          clearDiagnostics();
           const out = await buildTokens(msg.format, msg.scope, sel[0] || null, settings.unit, settings.remBase);
-          post({ type: 'tokens', format: msg.format, scope: msg.scope, out: out });
+          post({ type: 'tokens', format: msg.format, scope: msg.scope, out: out, diagnostics: takeDiagnostics() });
           break;
         }
         case 'design-shot': {
@@ -3617,7 +5004,7 @@ if (figma.mode === 'codegen') {
         case 'export-project': {
           const sel = figma.currentPage.selection;
           if (!sel.length) break;
-          const out = await generateCode(sel[0], msg.lang, settings.unit, settings.remBase, 1500, { withFonts: true });
+          const out = await generateCode(sel[0], msg.lang, settings.unit, settings.remBase, 1500, { withFonts: true, svgFrames: settings.svgFrames });
           const files = out.files.map(f => ({ name: f.name, text: f.code }));
           (out.fontFiles || []).forEach(f => files.push({ name: f.name, bytes: f.bytes }));
           const failures = (out.assetErrors || []).slice();

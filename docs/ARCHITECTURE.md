@@ -1,7 +1,7 @@
 # Architecture
 
 A map of the repository for someone who has to change the code, written to be read
-in ten minutes. It describes v1.2.0.
+in ten minutes. It describes v1.5.1.
 
 There is **no build step**. `code.js` and `ui.html` are loaded by Figma exactly as
 they are committed, so both are one file each, dependency-free, and ES2020-era
@@ -118,11 +118,59 @@ Message types (see `MSG_SCHEMA`): `ui-ready`, `settings`, `select`, `mark`, `exp
 `font-upload`, `font-remove`, `baseline-save`, `baseline-clear`, `measure-native`, `measure-clear`,
 `annotate-add`, `annotate-remove`, `notes-clear`, `goto`, `devres-add`,
 `devres-remove`, `map-save`, `map-remove`, `redlines`, `clear-redlines`, `notify`,
-`resize`.
+`resize`, plus the workspace group:
+
+| Message | Answer | Notes |
+|---|---|---|
+| `plan` | `plan` | Complexity + illustration classification for the selection. Read-only. |
+| `cancel` | — | Marks a `jobId`; `gen-code` stops at the next layer and answers `cancelled: true`. |
+| `thumb-request` | `thumb` | A 160 px PNG for a visible row (assets, design files). |
+| `a11y-ignore` / `a11y-unignore` | `a11y-ignored` | Records or clears a review decision in the file (`devready` / `a11y-ignore`); `ids` are capped at 50 and the stored map at 120 entries / 20 kB. |
+| `a11y-report` | `a11y-report` | Re-audits the selection and answers `{ format, out: { text, file } }` for Markdown or CSV. |
+| `store-get` / `store-set` | `store` / `store-ok` / `store-error` | `clientStorage` for `projects` and `history`, JSON-validated, 200 kB cap. |
+| `gh-status` | `gh-status` | Never throws: a network failure is reported as `error.code`. |
+| `gh-connect` / `gh-disconnect` | `gh-status` | The token is stored/removed in `clientStorage`; it is never echoed back. |
+| `gh-repos` / `gh-branches` / `gh-create-repo` | `gh-repos` / `gh-branches` / `gh-created` | Repository and branch discovery. |
+| `gh-tree` | `gh-tree` | Preview: `headSha` plus per-file `added`/`modified`/`unchanged`/`deleted`, computed from git blob hashes. |
+| `gh-commit` | `gh-committed` | Blobs → tree → commit → non-forced ref update. Every failure has a `code`. |
+
+The GitHub adapter is isolated: `ghRequest()` is the only `fetch()` call site in the
+plugin, it never throws, and it scrubs the token out of anything it returns
+(`ghScrub`). `docs/PUBLISHING.md` is the contract.
 
 **When you add a message type:** add it to `MSG_SCHEMA` with validators first, then
 the `case` in the switch, then `tests/run.js` → `messageValidation()` with an attack
 case. The test suite fails if a message reaches the API unvalidated.
+
+## The workspace
+
+The panel has eight tabs. Seven of them are new surfaces owned by `ui.html`; the
+**Design** tab is the original inspector and is untouched by them.
+
+```
+S.ws      projects: [{ id, name, files: [...], revisions: [...] }]   → clientStorage 'devready-projects'
+S.hist    revisions: [{ id, files: [{name,size,hash}], code }]       → clientStorage 'devready-history'
+S.run     the processing queue: { queue, active: { jobId }, done, total, cancelled }
+S.lastCode the files of the last successful run (drives the Code tab and GitHub)
+S.gh      GitHub state: status, repos, branches, tree, selection, busy, error, result
+S.tab / S.projView / S.assetsView / S.confirm     view state only
+```
+
+Rules that keep it coherent:
+
+- **One run at a time.** `filesNext()` starts the next queued file only after the
+  previous `code` reply is settled by `filesSettle()`, which also refuses replies
+  from other job ids. That is the dedupe and the backpressure in one place.
+- **Failures are per file.** A failed entry keeps its `error` string and stops only
+  itself; `Retry N failed` re-queues `status === 'error'` entries.
+- **Illustrations are decided in the engine, not the panel.** `illustrationPlan()`
+  runs inside `buildRawNode`, so every target and every path (panel, project ZIP,
+  Dev Mode codegen) sees the same classification.
+- **Nothing is written to GitHub until the preview is confirmed**, and the preview's
+  `headSha` travels with the commit so a moved branch is caught before any blob.
+
+Tests: `tests/platform.js` (20 checks) covers the queue, the adapter, the storage
+bound and the tab rendering; `tests/unit-ui.js` covers the panel's pure helpers.
 
 ## What is stored, and where
 
@@ -131,8 +179,11 @@ case. The test suite fails if a message reaches the API unvalidated.
 | Shared plugin data (`devready` namespace) on the design | `status`, `note`, `at` | The DevReady flag, used when native status isn't available |
 | Shared plugin data on the design | `baseline:0…n`, `baseline:n`, `baselineAt` | Change-tracking snapshot, chunked under Figma's 100 kB entry limit |
 | Shared plugin data on `figma.root` | `map:<key>` | Code Connect-style component mappings |
+| Shared plugin data on `figma.root` | `a11y-ignore` | Accessibility review decisions: `{"<nodeId>": "<reason>"}`, ≤120 entries and ≤20 kB, so a file records *why* a finding was accepted |
 | Shared plugin data on canvas notes | `note`, `noteText` | The canvas-note annotation fallback |
 | `figma.clientStorage` (per user) | `devready-settings`, `font:<family>\|<key>` | Settings, uploaded font files |
+| `figma.clientStorage` (per user) | `devready-projects`, `devready-history` | Workspace: projects, design entries, revisions (≤200 kB each) |
+| `figma.clientStorage` (per user) | `devready-github-token` | GitHub token, written only by `gh-connect`, deleted by `gh-disconnect` |
 | Native Figma properties | `devStatus`, `annotations`, `devResources` | Written where the plan/seat allows it |
 
 Nothing is stored on a server, because there is no server.

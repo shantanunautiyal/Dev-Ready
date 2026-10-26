@@ -17,57 +17,58 @@
   "networkAccess": {
     "allowedDomains": [
       "https://fonts.googleapis.com",
-      "https://fonts.gstatic.com"
+      "https://fonts.gstatic.com",
+      "https://api.github.com"
     ],
-    "reasoning": "The HTML preview can load public Google Fonts (e.g. Inter) so text renders in the design's typeface. Only public Google Fonts family names and weights are requested; private, commercial and system font names are never sent, and no design data, text or file information leaves Figma. The plugin's main code makes no network requests. Turn this off with ⋯ → Load Google Fonts in preview."
+    "reasoning": "Two independent, user-controlled paths. (1) The HTML preview may load public Google Fonts (e.g. Inter) so text renders in the design's typeface: only public family names and weights are requested and the option can be turned off in Settings. (2) The optional GitHub tab talks to api.github.com and only when you press a button there: it lists your repositories and branches, and when you commit it uploads the generated files you selected plus the commit message. The personal access token you paste is kept on this machine in Figma's plugin storage, is never written into the document, generated code or logs, and can be removed with Disconnect. Nothing is sent automatically and no design data leaves Figma unless you publish it."
   },
   "codegenLanguages": [
     {
-      "label": "DevReady · React + Tailwind",
+      "label": "DevReady \u00b7 React + Tailwind",
       "value": "react-tailwind"
     },
     {
-      "label": "DevReady · React + CSS",
+      "label": "DevReady \u00b7 React + CSS",
       "value": "react-css"
     },
     {
-      "label": "DevReady · React + TypeScript",
+      "label": "DevReady \u00b7 React + TypeScript",
       "value": "react-ts"
     },
     {
-      "label": "DevReady · React + TypeScript + Tailwind",
+      "label": "DevReady \u00b7 React + TypeScript + Tailwind",
       "value": "react-tailwind-ts"
     },
     {
-      "label": "DevReady · HTML + CSS",
+      "label": "DevReady \u00b7 HTML + CSS",
       "value": "html-css"
     },
     {
-      "label": "DevReady · Single HTML (CSS + assets in one file)",
+      "label": "DevReady \u00b7 Single HTML (CSS + assets in one file)",
       "value": "html-single"
     },
     {
-      "label": "DevReady · Vue (single-file component)",
+      "label": "DevReady \u00b7 Vue (single-file component)",
       "value": "vue"
     },
     {
-      "label": "DevReady · Svelte",
+      "label": "DevReady \u00b7 Svelte",
       "value": "svelte"
     },
     {
-      "label": "DevReady · React Native",
+      "label": "DevReady \u00b7 React Native",
       "value": "react-native"
     },
     {
-      "label": "DevReady · SwiftUI",
+      "label": "DevReady \u00b7 SwiftUI",
       "value": "swiftui"
     },
     {
-      "label": "DevReady · Jetpack Compose",
+      "label": "DevReady \u00b7 Jetpack Compose",
       "value": "compose"
     },
     {
-      "label": "DevReady · Flutter (Dart)",
+      "label": "DevReady \u00b7 Flutter (Dart)",
       "value": "flutter"
     }
   ],
@@ -83,6 +84,7 @@
         "react-ts",
         "react-tailwind-ts",
         "html-css",
+        "html-single",
         "vue",
         "svelte"
       ]
@@ -108,8 +110,13 @@
         "react-ts",
         "react-tailwind-ts",
         "html-css",
+        "html-single",
         "vue",
-        "svelte"
+        "svelte",
+        "react-native",
+        "swiftui",
+        "compose",
+        "flutter"
       ]
     }
   ],

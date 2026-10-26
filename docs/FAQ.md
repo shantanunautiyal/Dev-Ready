@@ -60,11 +60,23 @@ published to Figma Community, it will work anywhere.
 
 ### Does it send my design anywhere?
 
-No. **`code.js` makes no network requests.** Font classification uses a catalog of
-1,950 Google Fonts bundled into the plugin, so even a private font name never leaves
-Figma. The single exception is the *preview* iframe loading **public Google Fonts** so
-the HTML renders in the design's typeface; turn it off with
-**⋯ → Load Google Fonts in preview** for zero traffic. See [PRIVACY.md](../PRIVACY.md).
+Not unless you ask it to. Font classification uses a catalog of 1,950 Google Fonts
+bundled into the plugin, so even a private font name never leaves Figma. There are two
+network paths, both optional:
+
+1. the *preview* iframe loading **public Google Fonts** so the HTML renders in the
+   design's typeface — turn it off with **⋯ → Load Google Fonts in preview**;
+2. **GitHub publishing**, which only happens if you paste a token and press *Push*. It
+   sends the generated files you selected to your own repository.
+
+Code generation, inspection, tokens, exports and change tracking never touch the
+network. See [PRIVACY.md](../PRIVACY.md) and [PUBLISHING.md](PUBLISHING.md).
+
+### Does it push my code to GitHub automatically?
+
+No. The GitHub tab is inert until you connect a token, and even then nothing is written
+until you preview the changes, choose files and press *Commit & push*. Details and the
+required permissions: [PUBLISHING.md](PUBLISHING.md).
 
 ### The generated code doesn't match the design exactly
 
@@ -79,6 +91,26 @@ Two known causes, both visible in the UI:
 
 For layout differences, use **Code → Preview → Overlay → Difference**: identical
 pixels go black, so anything bright is a mismatch.
+
+### The accessibility audit flags something I disagree with
+
+Ignore it with a reason instead of turning the audit off. Every finding row has an
+*Ignore* button with six reasons (decorative, brand exception, legacy design, false
+positive, will fix later, approved by design). The decision is written to the file's
+shared plugin data (`devready` / `a11y-ignore`), so it survives reloads, collaborators
+see it, and the exported report lists it under **Ignored** with its WCAG criterion.
+*Unignore* in the same section restores the finding. If the *Ignore* button is missing,
+the file is open read-only (Dev Mode) — the audit still runs, it just cannot record a
+decision.
+
+### Which accessibility criteria can the audit not check?
+
+Anything that only exists once the design is rendered or used: colour-only meaning
+(a red dot that carries the only signal), whether a focus ring is actually visible,
+motion and animation, text spacing, and 1.4.10 reflow. Those are named in the panel's
+footnote rather than guessed at. Everything else the audit reports with its WCAG
+reference (`1.4.3`, `1.4.11`, `1.1.1`, `1.3.1`, `3.3.2`, `2.5.8`, `4.1.2`), and a
+background it cannot measure is reported as *unmeasured*, never as a pass.
 
 ### Where do variables/light-dark mode end up in the code?
 

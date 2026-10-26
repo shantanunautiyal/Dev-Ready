@@ -14,8 +14,124 @@ All notable changes to DevReady are listed here. The format follows [Keep a Chan
 - **Mixed absolute and auto-layout siblings keep Figma's paint order.** Bottom bars remain above earlier overlapping rows, including reversed auto-layout stacking.
 - **Wrapped Auto text has deterministic web line-height.** Compatible uniform text uses Figma's SVG baseline spacing; native targets keep their platform font metrics rather than receiving an inferred cross-platform line box.
 
+- **Design tokens survive real design systems.** An alias is followed through its whole
+  chain, so `--color-text: var(--core-ink)` no longer points at a variable that is hidden
+  or belongs to another file; when no target is exported the literal value is written
+  instead of `var(--undefined)`. Published **library** variables are part of the export,
+  unreadable values are kept and flagged (`$value: null` in DTCG, "could not be resolved"
+  in the header) and a cyclic alias terminates instead of writing `undefined`.
+- **A failed Figma read is no longer silent.** Calls whose errors were swallowed by empty
+  `catch` blocks — local variables, library collections, variable modes, font availability,
+  component mappings — leave a bounded, de-duplicated note that the panel shows as
+  “Limited data”, and that travels with the token export that triggered it.
+- **Snapshots have a byte budget, not only a layer cap.** 2,500 text-heavy layers serialise
+  to about a megabyte of shared plugin data; the snapshot now stops at 400,000 characters
+  and marks itself partial, so the Changes panel never claims “no changes” for layers it
+  did not read.
+- **A rejected commit always answers.** GitHub messages are shape-validated at the
+  message boundary and fully validated inside the adapter, so an unsafe path, a bad
+  repo name, a bad branch or an empty file list comes back as a named error instead of
+  being dropped — which used to leave the panel on “Pushing…” forever.
+- **Projects are named in the panel.** Creating or renaming a project used
+  `window.prompt()`, which Figma's plugin iframe blocks — the flow either threw or silently
+  produced “Untitled project”. It is now an inline form with a live field, unique-name
+  handling and an explicit Save/Create; a blank rename is refused instead of erasing the
+  name.
+- **The GitHub tab no longer re-requests status on every render.** One request is made
+  when the tab is first opened, and the reply clears the pending flag.
+- **Asset and design-file thumbnails are requested, not assumed.** The panel asks only
+  for the thumbnails it is about to show (8 asset rows, 12 file rows), scaled to 160 px.
+- **An ignored finding keeps its criterion.** Review decisions carry the WCAG rule
+  they exempt, so an exported report never lists a decided item without saying what
+  was decided; a newline in a layer name no longer breaks the report's list.
+- **Static HTML announces the design's language.** `lang` and `dir="rtl"` are derived from
+  the actual text (Arabic, Hebrew, Devanagari, Thai, Japanese, Korean, Chinese, Cyrillic),
+  instead of hard-coding `lang="en"` on every export.
+
 ### Added
-- Fourteen codegen-fidelity and follow-up regressions covering these cases (**158 checks total**).
+
+- **A tabbed workspace, without changing the inspector.** The panel gains Overview,
+  Design Files, Code, Assets, History, GitHub and Settings tabs around the existing
+  Design tab, which is untouched. Tabs are a real `role="tablist"` with roving
+  `tabindex`, arrow/Home/End keys, `aria-selected` and `aria-controls`; the open
+  section, scroll position and selections survive a switch.
+- **Projects hold several design files.** Create, rename, duplicate, archive and
+  delete projects; search them, sort by recent/name/created, and filter archived ones.
+  Each project owns its own entries, statuses, outputs and revisions, so switching
+  projects cannot mix assets or code. Importing the same layer twice is refused with
+  an explanation, and archiving follows the filter instead of hiding the project.
+- **A processing queue with per-file status.** *Generate all* runs the entries of a
+  project one at a time with a progress meter; every entry keeps `idle` / `running` /
+  `ok` / `error` plus its own error text, file count and timestamp. *Retry N failed*
+  re-runs only the failures, *Cancel* stops the queue at the next layer boundary, and
+  a second run for a file already running is refused. Progress is persisted, so
+  closing the panel does not lose it.
+- **A Code tab for the last run.** Files, sizes, per-file download, ZIP download,
+  truncation and asset-export warnings, the linked revision id, and shortcuts to
+  history and publishing.
+- **Job cancellation end to end.** `gen-code` accepts a `jobId`, `cancel` marks it,
+  the engine checks between layers, and a cancelled run answers immediately with
+  `cancelled: true` and no files — the panel never sits on “Building…”.
+- **Cost estimation before a run.** `assessComplexity()` reports layers, depth, text,
+  vectors, instances, images and a millisecond estimate, bounded at 6,000 layers with
+  warnings for the generation cap, deep nesting and expensive image fills. It travels
+  with the inspect state, and a `plan` message answers for the whole selection.
+- **Vector illustrations export as one SVG.** A self-contained artwork frame (named
+  like art, carrying an SVG export setting, or dense enough to be art rather than UI)
+  becomes a single sanitised SVG asset with its `viewBox`, gradients, masks and clip
+  paths intact, referenced like any other image with real `alt` text; its inner paths
+  are never emitted as elements. Frames with text, instances or raster content are
+  never treated as artwork, and `svgFrames: 'named' | 'off'` narrows or disables the
+  heuristic. A failed export degrades to normal element output with a note.
+- **Optional GitHub publishing.** Connect with a fine-grained token, list repositories
+  and branches, preview added / modified / deleted / unchanged files with per-file
+  selection, commit a message, and push. Every failure has its own code and sentence:
+  `auth`, `permission`, `rate-limit` (with the reset time), `conflict`, `network`,
+  `not-found`, plus local validation for paths, repo names, branches, empty selections
+  and size. Nothing is written before the preview is confirmed, a stale base commit is
+  detected before any blob is created, the ref update is never forced, reads retry once
+  on 5xx and writes never retry. The token lives in `clientStorage`, is used only in
+  the plugin thread, is scrubbed from every reply and is deleted on Disconnect.
+- **Local revisions with compare and restore.** Every successful run is recorded with
+  its files, sizes, hashes and code (when it fits), linked to the design layer that
+  produced it. History compares two revisions per file (added / removed / changed /
+  unchanged) with a line diff, and restores with a confirmation.
+- **An assets gallery.** Search by name, filter by type, 8 rows by default with
+  *Show all N* / *Show less*, thumbnails requested only for visible rows, per-asset
+  export, ZIP export and an explanation of what an illustration asset is.
+- **`docs/PUBLISHING.md`** — the complete contract for GitHub: why a token instead of
+  OAuth, required permissions, the API calls per action, limits, the error table,
+  conflict semantics and path validation. `PRIVACY.md` and `manifest.json` now describe
+  both network paths.
+- A second hardening suite: 34 regressions for token aliases and libraries, degraded-read
+  diagnostics, the snapshot budget, document language/direction and parser-level SVG
+  evasion, plus direct unit tests for the panel's helpers and its ZIP writer.
+- **Accessibility 2.0 — the audit now covers the criteria a release gate needs.**
+  Alongside text contrast (1.4.3) it measures **non-text contrast** for icons and
+  control outlines at 3:1 (1.4.11, using the paint an icon actually draws with,
+  including a paint inside the icon), **image alternatives** from the layer name with
+  a decorative heuristic and an auto-name detector (1.1.1), **heading order** derived
+  from the type scale with skipped levels reported (1.3.1), and **field labels** for
+  input-like layers (3.3.2) — plus the existing target-size, tiny-text and
+  nameless-control checks. Every finding carries its WCAG reference.
+- **Review decisions that survive the file.** Ignoring a finding stores its reason
+  (`Decorative`, `Brand exception`, `Legacy design`, `False positive`,
+  `Will fix later`, `Approved by design`) in the file's shared plugin data
+  (`devready` / `a11y-ignore`), capped at 120 entries and 20 kB, so collaborators see
+  the decision instead of an unexplained pass, and it can be restored with one click.
+- **Exportable accessibility report.** The panel exports Markdown (counts, failures by
+  criterion, findings grouped by rule, the ignored list with its reasons) or CSV for a
+  spreadsheet. Layer names are flattened and CSV values escaped, so a hostile or
+  multi-line name cannot break the table. Unmeasurable backgrounds are still reported
+  as unmeasured, never as a pass.
+- A fourth suite, `tests/a11y2.js`: 7 checks covering the new rules, ignore persistence
+  and caps, both report formats, report escaping, the empty audit and the panel
+  surface (**221 checks total**).
+- A third suite, `tests/platform.js`: 21 checks covering illustration detection and
+  its negative cases, end-to-end SVG assets, complexity caps, cancellation, the GitHub
+  adapter (connect, reject, rate limit, permission, 404, network, retry policy, commit
+  sequence, stale base, rejected ref, six unsafe inputs), local storage bounds, the
+  tabbed panel, the file queue and project management (**213 checks total**).
 
 ## [1.5.1] — 2026-10-20
 

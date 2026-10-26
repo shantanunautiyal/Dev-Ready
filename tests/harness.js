@@ -122,6 +122,7 @@ function loadEngine(B, options) {
   const store = {};
   const notifyLog = [];
   const writes = [];              // read-only violations (should stay empty in Dev Mode)
+  const docData = {};             // figma.root shared plugin data, as stored in the file
   const posted = [];
   const page = options.page || {
     name: 'Page 1', type: 'PAGE', children: [], selection: options.selection || [],
@@ -143,7 +144,19 @@ function loadEngine(B, options) {
       return bytes ? { getBytesAsync: async () => bytes } : null;
     },
     base64Encode: b => Buffer.from(b).toString('base64'),
-    root: { getSharedPluginDataKeys: () => [], getSharedPluginData: () => '', setSharedPluginData() {} },
+    // Shared plugin data is per file and persists between sessions, so the mock keeps
+    // it (with Figma's 100 kB per-entry limit) instead of returning ''.
+    root: {
+      name: options.fileName || 'Design file',
+      getSharedPluginDataKeys: ns => Object.keys(docData).filter(k => k.indexOf(ns + '/') === 0).map(k => k.slice(ns.length + 1)),
+      getSharedPluginData: (ns, k) => docData[ns + '/' + k] || '',
+      setSharedPluginData(ns, k, v) {
+        const key = ns + '/' + k;
+        if (v === undefined || v === null || v === '') { delete docData[key]; return; }
+        if (Buffer.byteLength(String(v), 'utf8') > 100 * 1024) throw new Error('in setSharedPluginData: This pluginData entry exceeds 100 kB per entry limit.');
+        docData[key] = String(v);
+      }
+    },
     clientStorage: { async getAsync(k) { return store[k]; }, async setAsync(k, v) { store[k] = v; }, async keysAsync() { return Object.keys(store); }, async deleteAsync(k) { delete store[k]; } },
     variables: {
       getVariableByIdAsync: async id => B.VARS[id] || null,
@@ -176,10 +189,10 @@ function loadEngine(B, options) {
   const sandbox = {
     figma, __html__: '', console,
     setTimeout, clearTimeout, Promise, Uint8Array, TextEncoder, TextDecoder,
-    fetch: async url => {
+    fetch: async (url, init) => {
       fetched.push(String(url));
       if (!options.fetch) throw new Error('offline (test default)');
-      return options.fetch(String(url));
+      return options.fetch(String(url), init || {});
     }
   };
   vm.createContext(sandbox);
@@ -194,7 +207,7 @@ function loadEngine(B, options) {
   };
   /** run(expr): evaluate inside the engine (reaches top-level const/let too). */
   return {
-    generateCode: sandbox.generateCode, ctx: sandbox, fetched, figma, notifyLog, writes, posted, page, send,
+    generateCode: sandbox.generateCode, ctx: sandbox, fetched, figma, notifyLog, writes, posted, page, send, docData,
     run: expr => vm.runInContext(expr, sandbox)
   };
 }
