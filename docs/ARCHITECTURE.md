@@ -127,6 +127,14 @@ Message types (see `MSG_SCHEMA`): `ui-ready`, `settings`, `select`, `mark`, `exp
 | `thumb-request` | `thumb` | A 160 px PNG for a visible row (assets, design files). |
 | `a11y-ignore` / `a11y-unignore` | `a11y-ignored` | Records or clears a review decision in the file (`devready` / `a11y-ignore`); `ids` are capped at 50 and the stored map at 120 entries / 20 kB. |
 | `a11y-report` | `a11y-report` | Re-audits the selection and answers `{ format, out: { text, file } }` for Markdown or CSV. |
+
+A message that fails validation answers `{ type: 'invalid', of, field, message }` as well as
+showing a canvas toast: the panel disables controls while a request is in flight, so a refusal
+must come back to it or the control stays disabled forever.
+
+`figma.ui.onmessage` is assigned immediately after `figma.showUI` and before the page watchers,
+which are wrapped in `try/catch`. A throw in an event registration used to leave the panel on
+screen with no handler at all — the failure mode that looks like "the plugin shows sample data".
 | `store-get` / `store-set` | `store` / `store-ok` / `store-error` | `clientStorage` for `projects` and `history`, JSON-validated, 200 kB cap. |
 | `gh-status` | `gh-status` | Never throws: a network failure is reported as `error.code`. |
 | `gh-connect` / `gh-disconnect` | `gh-status` | The token is stored/removed in `clientStorage`; it is never echoed back. |
