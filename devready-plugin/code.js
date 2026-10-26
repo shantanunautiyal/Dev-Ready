@@ -4642,6 +4642,12 @@ if (figma.mode === 'codegen') {
   /* MODE 2: Inspect UI (Design mode + Dev Mode Inspect panel)        */
   /* ================================================================ */
   figma.showUI(__html__, { width: 480, height: 820, themeColors: true, title: 'DevReady Inspect' });
+  /* The message handler is attached before anything else runs. A throw in the page
+     watchers below used to leave the panel on screen with no handler at all — which
+     looks exactly like "the plugin is showing sample data", because every ui-ready,
+     gh-status and gen-code request is dropped. handleUiMessage is a function
+     declaration in this block, so it is hoisted and already callable here. */
+  figma.ui.onmessage = handleUiMessage;
 
   let reqId = 0;
   let timer = null;
@@ -4773,14 +4779,16 @@ if (figma.mode === 'codegen') {
     } catch (e) { /* ignore */ }
   }
 
-  figma.on('selectionchange', () => schedule(80));
-  figma.on('currentpagechange', () => { watchPage(); schedule(); });
-  watchPage();
-
-  figma.ui.onmessage = async function (raw) {
+  async function handleUiMessage(raw) {
     const msg = validateMsg(raw);
     if (!msg) return; // unknown message type: ignore
-    if (msg.type === '__invalid') { figma.notify('DevReady: invalid ' + msg.field + ' for ' + msg.of, { error: true }); return; }
+    if (msg.type === '__invalid') {
+      // The panel disables controls while a request is in flight, so a rejected
+      // field has to come back to it — a canvas toast alone leaves it spinning.
+      figma.notify('DevReady: invalid ' + msg.field + ' for ' + msg.of, { error: true });
+      post({ type: 'invalid', of: msg.of, field: msg.field, message: 'DevReady refused ' + msg.field + ' for ' + msg.of + '.' });
+      return;
+    }
     try {
       switch (msg.type) {
         case 'ui-ready': {
@@ -4942,8 +4950,14 @@ if (figma.mode === 'codegen') {
           await ghSetToken(msg.token);
           const st = await ghStatus();
           if (!st.connected) {
-            await ghSetToken(null);
-            post({ type: 'gh-status', status: { connected: false, error: st.error || { code: 'auth', message: 'GitHub did not accept that token.' } } });
+            const err = st.error || { code: 'auth', message: 'GitHub did not accept that token.' };
+            // A network failure is not a bad token. Throwing the token away here meant
+            // an offline moment or a blocked api.github.com looked like "GitHub rejected
+            // the token", and the user had to paste it again for no reason.
+            const transient = ['network', 'timeout', 'rate-limit', 'unavailable', 'http-502', 'http-503', 'http-504'].indexOf(err.code) > -1;
+            post({ type: 'gh-status', status: { connected: false, stale: transient, error: err } });
+            figma.notify(transient ? 'GitHub is unreachable — the token was kept on this machine' : 'GitHub did not accept that token', { error: true });
+            if (!transient) await ghSetToken(null);
             break;
           }
           figma.notify('GitHub connected as ' + st.login);
@@ -5191,5 +5205,16 @@ if (figma.mode === 'codegen') {
       figma.notify(String(err && err.message || err), { error: true });
       post({ type: 'error', message: String(err && err.message || err) });
     }
-  };
+  }
+
+  /* Tracking is an optimisation, never a prerequisite. Wrapped so an editor that
+     rejects an event cannot leave the panel unable to refresh at all. */
+  try {
+    figma.on('selectionchange', () => schedule(80));
+    figma.on('currentpagechange', () => { watchPage(); schedule(); });
+    watchPage();
+  } catch (e) {
+    diag('page watcher', e);
+    post({ type: 'error', message: 'Selection tracking is unavailable in this editor — use Retry in the panel to refresh.' });
+  }
 }
