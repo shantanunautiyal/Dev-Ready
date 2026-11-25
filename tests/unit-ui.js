@@ -72,7 +72,7 @@ function loadPanel() {
   ['esc', 'fmtColor', 'ago', 'fmtDate', 'makeZip', 'hl', 'resIcon', 'host', 'I', 'S', 'hsl', 'rgbaCss', 'secDiagnostics', 'diagNote',
     'renderTabs', 'render', 'renderNow', 'appAction', 'setTab', 'viewGithub', 'viewAssets', 'viewHistory', 'viewSettings',
     'viewOverview', 'histPush', 'histDiffHtml', 'lineDiff', 'filteredAssets', 'wsEnsure', 'wsActive', '$', 'document',
-    'projList', 'wsArchive', 'wsNewProject', 'wsRename', 'wsCreateNamed', 'wsRenameTo', 'uniqueName', 'ghPreviewRows', 'ghLocalFiles', 'viewFiles', 'viewCode', 'filesRun', 'filesRunOne', 'filesCancel', 'filesSettle', 'codeDownloadAll', 'lastCodeFrom'].forEach(name => {
+    'TABS', 'projList', 'wsArchive', 'wsNewProject', 'wsRename', 'wsCreateNamed', 'wsRenameTo', 'uniqueName', 'ghPreviewRows', 'ghLocalFiles', 'viewFiles', 'viewCode', 'filesRun', 'filesRunOne', 'filesCancel', 'filesSettle', 'codeDownloadAll', 'lastCodeFrom'].forEach(name => {
     Object.defineProperty(api, name, { get: () => vm.runInContext(name, sandbox), enumerable: true });
   });
   api.get = name => vm.runInContext(name, sandbox);

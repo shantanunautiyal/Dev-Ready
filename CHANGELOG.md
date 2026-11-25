@@ -5,6 +5,35 @@ All notable changes to DevReady are listed here. The format follows [Keep a Chan
 ## [Unreleased]
 
 ### Fixed
+- **A silent plugin thread is reported, not disguised as sample data.** When nothing
+  answered within 1.5 s the panel used to load its built-in sample design: the header
+  read "Pay button / Checkout · Mobile", the selection never followed the canvas, a pasted
+  GitHub token went nowhere (the panel's `send()` is a no-op in that mode) and the GitHub
+  tab sat on "Checking GitHub connection…" with no way out. The panel now says it is not
+  connected, explains why, and offers **Retry**; sample data is only offered when
+  `ui.html` is opened directly outside Figma.
+- **The message handler is attached before anything that can throw.** `figma.ui.onmessage`
+  was assigned after the page watchers; an editor that rejected an event registration left
+  the panel open with no handler, so every `ui-ready`, `gh-status` and `gen-code` was
+  dropped. The handler is now assigned right after `figma.showUI`, the watchers run inside
+  `try/catch`, and the panel is told when tracking is unavailable.
+- **A refused message answers the panel.** Validation failures only raised a canvas toast,
+  so the control that sent the request stayed disabled ("Checking…", "Pushing…") with no
+  recovery. They now also answer `{ type: 'invalid', of, field, message }`, and `error`
+  answers release the code queue and the GitHub spinner.
+- **GitHub cannot hang.** Every GitHub request now has a 12 s watchdog with a visible
+  timeout state and a **Retry**; previously a dropped reply left "Checking GitHub
+  connection…" on screen forever.
+- **A valid token is no longer discarded when GitHub is unreachable.** `gh-connect` cleared
+  the saved token on *any* failure, including network errors and timeouts, so an offline
+  moment or a blocked `api.github.com` looked like "GitHub rejected the token" and had to be
+  re-pasted. Transient failures now keep the token and the panel says so ("Your token is
+  saved · Retry"); only `auth`/`permission` answers remove it.
+- **Workspace tabs are padded.** `#main` has no horizontal padding — the Design tab pads
+  itself in `.sec-h`/`.sec-b` — so Code, Design Files, Assets, History, GitHub and Settings
+  ran flush against the panel edge. Tab views now share a padded container.
+- **The accessibility section survives a clean layer.** It returned `''` when a layer had no
+  findings, which also hid the *Export report*, *CSV* and *Unignore* controls.
 - **Design text stays text.** Export settings on a `TEXT` layer no longer turn copy into an image, zero-opacity layers are omitted, and single-line auto-sized text uses its exact line box instead of the browser-dependent `normal` line-height.
 - **Raster artwork is no longer mistaken for a vector icon.** Image-filled rectangles, ellipses and nested avatar stacks stay raster assets, including image content nested in boolean operations.
 - **Container image fills are real assets.** Multi-file web targets emit files and matching CSS URLs; single-file HTML embeds the original bytes. React Tailwind URLs are valid JSX, multiple image fills retain their own assets, and native targets render a supported single image fill instead of ignoring it. Unresolved Figma `url(<path-to-image>)` placeholders are rejected instead of leaking into output.
@@ -126,7 +155,15 @@ All notable changes to DevReady are listed here. The format follows [Keep a Chan
   as unmeasured, never as a pass.
 - A fourth suite, `tests/a11y2.js`: 7 checks covering the new rules, ignore persistence
   and caps, both report formats, report escaping, the empty audit and the panel
-  surface (**221 checks total**).
+  surface.
+- A fifth suite, `tests/hardening.js`: 10 checks for the failure modes above — a rejected
+  event registration still leaves a working handler, refused messages answer the panel, a
+  transient GitHub failure keeps the token while a 401 removes it, the disconnected panel
+  never shows another design, GitHub timeouts and stale tokens offer a retry, tab views are
+  padded, a clean layer keeps its report controls, failed requests release the queue, and
+  the two message contracts hold (every message the panel sends is in `MSG_SCHEMA`, every
+  answer the engine posts is accepted, every rendered control has a handler)
+  (**231 checks total**).
 - A third suite, `tests/platform.js`: 21 checks covering illustration detection and
   its negative cases, end-to-end SVG assets, complexity caps, cancellation, the GitHub
   adapter (connect, reject, rate limit, permission, 404, network, retry policy, commit

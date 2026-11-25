@@ -123,6 +123,7 @@ function loadEngine(B, options) {
   const notifyLog = [];
   const writes = [];              // read-only violations (should stay empty in Dev Mode)
   const docData = {};             // figma.root shared plugin data, as stored in the file
+  let shown = false;              // showUI was reached
   const posted = [];
   const page = options.page || {
     name: 'Page 1', type: 'PAGE', children: [], selection: options.selection || [],
@@ -166,7 +167,11 @@ function loadEngine(B, options) {
     getLocalPaintStylesAsync: async () => options.paintStyles || [],
     getLocalTextStylesAsync: async () => options.textStyles || [],
     notify(msg, opts) { notifyLog.push({ text: String(msg), error: !!(opts && opts.error) }); },
-    on() {}, showUI() {}, ui: { postMessage(m) { posted.push(m); }, on() {}, resize() {} }
+    // options.throwOnEvent: some editor/API combinations reject an event registration.
+    // Used to prove the panel still gets a message handler when that happens.
+    on() { if (options.throwOnEvent) throw new Error('editor rejects event registration'); },
+    showUI() { shown = true; },
+    ui: { postMessage(m) { posted.push(m); }, on() {}, resize() {} }
   };
   // Document writes throw in Dev Mode (figma.com/plugin-docs/working-in-dev-mode). Model that
   // so a read-only path that reaches for the canvas fails loudly here instead of in Figma.
@@ -207,6 +212,7 @@ function loadEngine(B, options) {
   };
   /** run(expr): evaluate inside the engine (reaches top-level const/let too). */
   return {
+    shown: () => shown,
     generateCode: sandbox.generateCode, ctx: sandbox, fetched, figma, notifyLog, writes, posted, page, send, docData,
     run: expr => vm.runInContext(expr, sandbox)
   };

@@ -1051,7 +1051,7 @@ Copy this into an issue per phase.
 
 ## Appendix — implementation status (2026-10-27)
 
-The suite has grown from 158 to **221 checks** while every item below landed; `npm test`,
+The suite has grown from 158 to **231 checks** while every item below landed; `npm test`,
 `npm run lint` and `npm run check` are green after each batch.
 
 The second appendix below (`Appendix B`) records the multi-file / illustration / GitHub
@@ -1138,7 +1138,7 @@ regression net for all of it.
 
 Closes item #7 / IMP-31 / F-03 to the point where the audit can gate a release, and is explicit
 about the criteria a static design cannot answer. `tests/a11y2.js` (7 checks) is the regression
-net; the suite is **221 checks**.
+net; the suite is **231 checks**.
 
 | Requested (F-03 / IMP-31) | Status | Where it lives |
 |---|---|---|
@@ -1162,3 +1162,26 @@ net; the suite is **221 checks**.
 - Review decisions live in the file's shared plugin data: they need write access, which Dev
   Mode may not have. In read-only Dev Mode the audit still runs and reports honestly, but
   ignoring a finding is refused rather than silently lost.
+
+---
+
+## Appendix D — Connection robustness (2026-10-27)
+
+Reported from a real session: the panel opened on *sample data*, a pasted GitHub token did
+nothing, the GitHub tab never left "Checking GitHub connection…", and every workspace tab
+ran flush against the panel edge. None of these were rendering bugs; each was a state the
+panel could reach and never leave. `tests/hardening.js` (10 checks) now pins all of them.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Panel shows "Pay button / Checkout · Mobile" whatever is selected; token never sent; GitHub stuck | Nothing answered within 1.5 s, so the panel loaded its built-in sample design. In that mode `send()` is a no-op and `gh-status` had no timeout | Explicit disconnected state with **Retry**; sample data only outside Figma; 12 s GitHub watchdog |
+| Panel opens, then ignores every click | `figma.ui.onmessage` was assigned *after* the page watchers; a rejected `figma.on` registration left the thread with no handler | Handler assigned immediately after `showUI`, watchers wrapped, panel told when tracking is unavailable |
+| A request stays "Checking…" forever | Validation failures raised a canvas toast only; the panel never learned | `{ type: 'invalid', of, field, message }` answer + `error`/`invalid` release spinners and the queue |
+| "GitHub rejected the token" for a good token | `gh-connect` cleared the saved token on *any* failure, including `network`/`timeout` | Only `auth`/`permission` removes it; transient failures keep it and say so |
+| Tabs touch the panel edge | `#main` has no padding; only the Design tab's sections pad themselves | `main.tabview { padding: … }` for every workspace tab |
+| Accessibility controls vanish on tidy designs | `secA11y()` returned `''` when a layer had no findings | The section always renders, with an empty state and the export buttons |
+
+Two contracts are now tested rather than assumed: every message the panel sends exists in
+`MSG_SCHEMA` (otherwise `validateMsg()` drops it and the control waits forever), every
+answer the engine posts is accepted by the panel, and every `data-act` rendered in the panel
+has a handler.

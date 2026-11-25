@@ -9,7 +9,7 @@ Inspect specs like Dev Mode, generate real code in 12 targets, see what changed 
   <a href=".github/workflows/ci.yml"><img src="https://github.com/Ankushui18/Dev-Ready/actions/workflows/ci.yml/badge.svg" alt="Tests"></a>
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT">
   <img src="https://img.shields.io/badge/Figma-Design%20%2B%20Dev%20Mode-0d99ff" alt="Figma Design + Dev Mode">
-  <img src="https://img.shields.io/badge/tests-221%20passing-brightgreen" alt="221 checks passing">
+  <img src="https://img.shields.io/badge/tests-231%20passing-brightgreen" alt="231 checks passing">
 </p>
 
 ---
@@ -237,7 +237,7 @@ cannot fight over the same layer.
 ```bash
 npm ci
 npm run verify        # layout + Figma sandbox check + ESLint + tests (what CI runs)
-npm test              # 221 checks: 9 fixtures × 12 targets, privacy, messages, tracking,
+npm test              # 231 checks: 9 fixtures × 12 targets, privacy, messages, tracking,
                       # tsc, golden output, a real bundle of the generated React project,
                       # the tabbed workspace and the GitHub adapter (all offline)
 npm test -- --update-golden   # accept a deliberate change to generated output
@@ -272,6 +272,8 @@ Honest list — these are APIs Figma doesn't give plugins, not things we haven't
 - **Change tracking** shows before → after for position, size, fills, strokes, radius, effects, layout/padding, font and text (first 80 characters). Gradients stops and individual effect parameters are flagged by category only. It covers the first 2,500 layers of a frame, or 400,000 characters of snapshot data, whichever comes first — past that the snapshot marks itself partial rather than claiming "no changes".
 - **Illustration detection is a heuristic.** It uses names, export settings and vector density. A hand-drawn vector that looks like UI can still be exported as one SVG (switch to `named`), and a loosely named illustration may still be generated as elements (rename it, or add an SVG export setting).
 - **GitHub publishing needs a fine-grained token** with *Contents: read and write* (plus *Administration: write* to create repositories). Figma plugins have no OAuth redirect, so the token is pasted in and kept in `clientStorage`; see [docs/PUBLISHING.md](docs/PUBLISHING.md) for the full contract and the error table.
+- **The panel never fakes a connection.** If the plugin thread does not answer within 1.5 s, the panel says so and offers *Retry* — it does not substitute sample data, because that made a broken session look like a working one (every action was a silent no-op). Sample data is only offered when `ui.html` is opened directly outside Figma.
+- **Every request has an end.** Code generation times out after 20 s and GitHub requests after 12 s, each with a Retry; a message the engine refuses comes back as a visible error and releases the controls it disabled.
 - **The accessibility audit is a static analysis.** Text and non-text contrast, alt-text hints, heading order, field labels and target sizes come from the layers themselves. Colour-only meaning, focus-ring visibility, motion, text spacing and reflow only exist in a rendered, used interface, so the audit names them as out of scope instead of guessing. Alt text is inferred from layer names and marked *inferred* in the report; an "ignored" decision needs write access, so it is unavailable in Dev Mode (the audit still runs).
 - **Local history is local.** Projects and revisions live in `clientStorage` (200 kB per key, 20 projects, 8 revisions). They are not synced between machines and do not survive uninstalling the plugin.
 - **SwiftUI, Compose, Flutter and React Native output** is checked for structure and safe escaping, but not compiled in CI. JSX and CSS are parsed by esbuild. Native text with Figma Auto line-height uses the platform font engine's metrics; SVG baseline measurements are applied only to web CSS, where they have a direct meaning.

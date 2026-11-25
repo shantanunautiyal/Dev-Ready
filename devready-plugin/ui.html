@@ -86,6 +86,12 @@
   a { color: var(--brand-fg); text-decoration: none; }
   svg { display: block; flex-shrink: 0; }
   main { flex: 1; overflow-y: auto; overflow-x: hidden; }
+  /* Design pads itself in .sec-h / .sec-b; the workspace tabs write straight into
+     #main, so without this every one of them sits flush against the panel edge. */
+  main.tabview { padding: 2px 16px 16px; }
+  .offline { margin: 8px 16px 0; padding: 10px 12px; border-radius: 6px; background: color-mix(in srgb, #ffcd29 22%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, #ffcd29 45%, transparent); }
+  .offline b { display: block; margin-bottom: 2px; }
+  .offline .faint { line-height: 1.5; }
   main::-webkit-scrollbar { width: 8px; } main::-webkit-scrollbar-thumb { background: var(--bg3); border-radius: 8px; border: 2px solid var(--bg); }
 
   /* ---------- header ---------- */
@@ -1106,6 +1112,44 @@ function a11yDom() {
   document.querySelectorAll('#main .sec-t').forEach(b => { const sec = b.closest('.sec'); if (sec) b.setAttribute('aria-expanded', String(!sec.classList.contains('closed'))); });
   document.querySelectorAll('#main .sec').forEach(sec => { if (!sec.getAttribute('aria-label')) { const t = sec.querySelector('.sec-t'); if (t) sec.setAttribute('aria-label', t.textContent.trim()); } });
 }
+/* Inside Figma a silent plugin thread is a fault, not a preview. Showing another
+   design's data here (the old behaviour) made every action look broken: the token
+   was never sent, the GitHub tab never answered, and the selection never followed.
+   Sample data is now an explicit choice, and only offered outside Figma. */
+function renderDisconnected() {
+  const host = (window.parent && window.parent !== window) ? 'the plugin thread' : 'the page';
+  $('hdr').innerHTML = '<div class="hdr-row"><div class="name">DevReady</div></div>' +
+    '<div class="h-type"><span class="faint">Not connected</span></div>';
+  $('main').innerHTML = '<div class="offline"><b>No answer from ' + esc(host) + '</b>' +
+    '<span class="faint">The panel opened but nothing replied within 1.5 s, so there is no design data to show. ' +
+    'Reopen the plugin (Plugins → Development), then retry. If it keeps happening, close the plugin window and run it again — ' +
+    'a plugin error toast from Figma explains the cause.</span></div>' +
+    '<div class="row-btns" style="margin-top:10px">' +
+    '<button class="btn blue" data-act="retry-connect">Retry</button>' +
+    (window.parent === window ? '<button class="btn" data-act="use-samples">Show sample data</button>' : '') +
+    '</div>' +
+    '<div class="faint" style="margin-top:10px">Nothing you typed has been sent anywhere. The panel does not show another ' +
+    'design while it is disconnected, so nothing you see here can be mistaken for your file.</div>';
+}
+function retryConnect() {
+  S.disconnected = false; S.got = false;
+  send({ type: 'ui-ready' });
+  send({ type: 'store-get', key: 'projects' });
+  send({ type: 'store-get', key: 'history' });
+  send({ type: 'plan' });
+  render();
+  setTimeout(() => {
+    if (S.got) { toast('Connected'); return; }
+    S.disconnected = true; render();
+    toast('Still no answer from Figma — reopen the plugin');
+  }, 2000);
+}
+function useSamples() {
+  S.disconnected = false; S.demo = true;
+  S.data = JSON.parse(JSON.stringify(DEMO));
+  Object.keys(DEMO_THUMBS).forEach(k => { S.thumbs[k] = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(DEMO_THUMBS[k]); });
+  render();
+}
 function render() {
   const v = viewState();
   S._autoFocus = false;
@@ -1115,8 +1159,12 @@ function renderNow() {
   $('demo').style.display = S.demo ? 'block' : 'none';
   renderTabs();
   const d = S.data;
+  const main = $('main');
+  const tabby = !!(S.tab && S.tab !== 'design');
+  if (main && main.classList) { if (tabby) main.classList.add('tabview'); else main.classList.remove('tabview'); }
+  if (S.disconnected) return renderDisconnected();
   // The workspace tabs own the panel; Design is the original inspector.
-  if (S.tab && S.tab !== 'design') return renderTabView(d);
+  if (tabby) return renderTabView(d);
   if (!d) { $('hdr').innerHTML = '<div class="hdr-row"><div class="name">DevReady</div></div>'; $('main').innerHTML = ''; return; }
   if (d.mode === 'empty') return renderEmpty(d);
   if (d.mode === 'locked') return renderLocked(d);
@@ -1475,9 +1523,11 @@ const A11Y_FALLBACK_REASONS = ['Decorative', 'Brand exception', 'Legacy design',
 const A11Y_KIND_LABEL = { contrast: 'Text contrast', nontext: 'Non-text contrast', alt: 'Image alt text', heading: 'Heading order', form: 'Field label', target: 'Target size', label: 'Accessible name', size: 'Readability' };
 function secA11y(d) {
   const a = d.a11y;
-  if (!a || !a.items || !a.items.length) return '';
-  const c = a.counts;
-  const groups = a.groups && a.groups.length ? a.groups : a.items.map(i => ({ kind: i.kind, status: i.status, count: 1, ids: [i.id], item: i }));
+  // A clean layer still gets the section: the export buttons and the "ignored"
+  // list live here, and hiding the section made them unreachable on tidy designs.
+  if (!a || (!a.items && !a.groups && !a.counts)) return '';
+  const c = a.counts || { fail: 0, warn: 0, pass: 0, unknown: 0, ignored: 0 };
+  const groups = a.groups && a.groups.length ? a.groups : (a.items || []).map(i => ({ kind: i.kind, status: i.status, count: 1, ids: [i.id], item: i }));
   const issues = groups.filter(g => g.status !== 'pass');
   const ignored = a.ignored || [];
   const pills = '<div class="a-sum">' +
@@ -1667,6 +1717,9 @@ document.addEventListener('click', e => {
   }
   const a = t.closest('[data-act]'); if (!a) return;
   const act = a.getAttribute('data-act');
+  // Reachable while the panel is disconnected, i.e. before any state has arrived.
+  if (act === 'retry-connect') { retryConnect(); return; }
+  if (act === 'use-samples') { useSamples(); return; }
   if (appAction(act, a)) return;
   if (/-menu$/.test(act)) { if ($('menu').classList.contains('on') && S.menuAnchor === a) { closeMenu(); S.menuAnchor = null; return; } S.menuAnchor = a; menuFor(act, a); return; }
   const sp = S.data && S.data.spec;
@@ -1989,7 +2042,7 @@ function renderTabs() {
 function setTab(id) {
   if (!TABS.some(t => t.id === id)) return;
   S.tab = id;
-  if (id === 'github' && S.gh.status === undefined) send({ type: 'gh-status' });
+  if (id === 'github' && S.gh.status === undefined && !S.gh.pending) { S.gh.pending = true; ghAsk('gh-status', null, 'the connection check'); }
   if (id === 'overview' && !S.plan) send({ type: 'plan' });
   render();
 }
@@ -2149,6 +2202,19 @@ function filesNext() {
   f.status = 'running'; f.error = '';
   render();
   send({ type: 'gen-code', lang: S.run.lang, nodeId: f.nodeId, requestId: S.run.active.requestId, jobId: jobId });
+}
+/** A request that fails before the engine answers: without this the queue entry
+ *  stays "running" and every later run is refused with "a run is in progress". */
+function filesFail(message) {
+  const a = S.run.active;
+  if (!a) return false;
+  const f = wsFileEntry(wsActive(), a.fileId);
+  if (f) { f.status = 'error'; f.error = String(message || 'The request was rejected').slice(0, 200); }
+  S.run.lastError = String(message || '').slice(0, 200);
+  S.run.active = null;
+  S.run.queue = [];
+  wsSave();
+  return true;
 }
 function filesCancel() {
   if (!S.run.active) { toast('No run in progress'); return; }
@@ -2338,6 +2404,28 @@ function histRestore(id) {
 
 /* ---------- GitHub ---------- */
 function ghConnected() { return !!(S.gh.status && S.gh.status.connected); }
+/* Every GitHub request must land somewhere. A dropped reply used to leave
+   "Checking GitHub connection…" on screen forever, with no control to get out:
+   the panel disabled the buttons that could have retried. */
+const GH_TIMEOUT_MS = 12000;
+let ghTimer = null;
+function ghSettle() {
+  if (ghTimer) { clearTimeout(ghTimer); ghTimer = null; }
+  S.gh.timeout = '';
+  S.gh.busy = '';
+  S.gh.pending = false;
+}
+function ghAsk(type, extra, label) {
+  if (ghTimer) clearTimeout(ghTimer);
+  const what = label || type.replace(/^gh-/, '');
+  send(Object.assign({ type: type }, extra || {}));
+  ghTimer = setTimeout(() => {
+    ghTimer = null;
+    S.gh.busy = ''; S.gh.pending = false;
+    S.gh.timeout = what;
+    if (S.tab === 'github' || S.tab === 'settings') render();
+  }, GH_TIMEOUT_MS);
+}
 function ghErrorBox(err) {
   if (!err) return '';
   const tips = {
@@ -2382,11 +2470,26 @@ function viewGithub() {
   const g = S.gh;
   tabHeader('GitHub', 'Optional — publish generated code to a repository', ghConnected() ? '' : '');
   if (g.status === undefined) {
-    $('main').innerHTML = '<div class="empty-tab">Checking GitHub connection…</div>';
-    if (!g.pending) { g.pending = true; send({ type: 'gh-status' }); }
+    const stuck = g.timeout
+      ? '<div class="offline" style="margin:8px 0"><b>GitHub did not answer</b><span class="faint">The check for a saved token timed out after ' +
+        Math.round(GH_TIMEOUT_MS / 1000) + ' s. Nothing was sent to GitHub. Retry, or reopen the plugin if it keeps timing out.</span></div>' +
+        '<div class="row-btns" style="margin-top:8px"><button class="btn blue" data-act="gh-retry">Retry</button></div>'
+      : '<div class="empty-tab">Checking GitHub connection…</div>';
+    $('main').innerHTML = stuck;
+    if (!g.pending && !g.timeout) { g.pending = true; ghAsk('gh-status', null, 'the connection check'); }
     return;
   }
   let html = '';
+  if (!ghConnected() && g.status && g.status.stale) {
+    // The token is still on this machine; only GitHub could not be reached.
+    html += ghErrorBox(g.status.error) +
+      '<div class="offline" style="margin:8px 0"><b>Your token is saved</b><span class="faint">GitHub could not be reached, so the connection could not be confirmed. ' +
+      'Nothing was deleted — you do not need to paste the token again. Retry when the network is back.</span></div>' +
+      '<div class="row-btns"><button class="btn blue" data-act="gh-retry">Retry</button>' +
+      '<button class="mini" data-act="gh-disconnect">Remove the saved token</button></div>';
+    $('main').innerHTML = html;
+    return;
+  }
   if (!ghConnected()) {
     html += g.status && g.status.error ? ghErrorBox(g.status.error) : '';
     html += '<div class="gh-box"><h4>Connect GitHub</h4>' +
@@ -2399,6 +2502,11 @@ function viewGithub() {
     return;
   }
   const st = g.status;
+  if (g.timeout) {
+    html += '<div class="offline" style="margin:0 0 8px"><b>GitHub did not answer</b><span class="faint">' +
+      'The request for ' + esc(g.timeout) + ' timed out after ' + Math.round(GH_TIMEOUT_MS / 1000) + ' s. Nothing was changed on GitHub — retry below.</span></div>' +
+      '<div class="row-btns" style="margin-bottom:8px"><button class="btn" data-act="gh-retry">Retry</button></div>';
+  }
   html += '<div class="gh-box"><div class="row-line"><span class="nm">' + I.github + ' <b>' + esc(st.login) + '</b>' + (st.scopes ? '<br><span class="faint">scopes: ' + esc(st.scopes) + '</span>' : '') + '</span>' +
     '<button class="mini" data-act="gh-disconnect">Disconnect</button></div>' + ghErrorBox(g.error) + '</div>';
 
@@ -2560,24 +2668,30 @@ function appAction(act, el) {
   }
   if (act === 'hist-cmp') { S.hist.cmp = S.hist.cmp === el.getAttribute('data-id') ? null : el.getAttribute('data-id'); render(); return true; }
   if (act === 'hist-restore') { histRestore(el.getAttribute('data-id')); return true; }
+  if (act === 'gh-retry') {
+    S.gh.timeout = ''; S.gh.status = undefined; S.gh.error = null;
+    S.gh.busy = 'status'; render();
+    ghAsk('gh-status', null, 'the connection check');
+    return true;
+  }
   if (act === 'gh-connect') {
     const f = $('gh-token');
     const token = f ? f.value.trim() : '';
     if (!/^[A-Za-z0-9_]{20,255}$/.test(token)) { toast('Paste a GitHub token (ghp_… or github_pat_…)'); return true; }
-    S.gh.busy = 'connect'; S.gh.error = null; render();
-    send({ type: 'gh-connect', token: token });
+    S.gh.busy = 'connect'; S.gh.error = null; S.gh.timeout = ''; render();
+    ghAsk('gh-connect', { token: token }, 'the token check');
     return true;
   }
-  if (act === 'gh-disconnect') { send({ type: 'gh-disconnect' }); return true; }
-  if (act === 'gh-repos') { S.gh.busy = 'repos'; S.gh.error = null; render(); send({ type: 'gh-repos' }); return true; }
+  if (act === 'gh-disconnect') { S.gh.busy = 'disconnect'; ghAsk('gh-disconnect', null, 'disconnecting'); return true; }
+  if (act === 'gh-repos') { S.gh.busy = 'repos'; S.gh.error = null; S.gh.timeout = ''; render(); ghAsk('gh-repos', null, 'the repository list'); return true; }
   if (act === 'gh-repos-all') { S.gh.reposAll = !S.gh.reposAll; render(); return true; }
   if (act === 'gh-pick') {
     S.gh.repo = el.getAttribute('data-repo'); S.gh.branches = []; S.gh.branch = ''; S.gh.tree = null; S.gh.result = null; S.gh.files = {};
     S.gh.busy = 'branches'; render();
-    send({ type: 'gh-branches', repo: S.gh.repo });
+    ghAsk('gh-branches', { repo: S.gh.repo }, 'the branch list');
     return true;
   }
-  if (act === 'gh-branches') { if (!S.gh.repo) return true; S.gh.busy = 'branches'; render(); send({ type: 'gh-branches', repo: S.gh.repo }); return true; }
+  if (act === 'gh-branches') { if (!S.gh.repo) return true; S.gh.busy = 'branches'; render(); ghAsk('gh-branches', { repo: S.gh.repo }, 'the branch list'); return true; }
   if (act === 'gh-branch') { S.gh.branch = el.getAttribute('data-branch'); S.gh.tree = null; render(); return true; }
   if (act === 'gh-create') {
     const name = ($('gh-new-name') || {}).value || '';
@@ -2599,7 +2713,7 @@ function appAction(act, el) {
     files.forEach(f => { bytes += String(f.content || '').length; });
     const payload = bytes <= 1500000 ? files.slice(0, 200) : undefined;
     S.gh.busy = 'tree'; S.gh.compared = !!payload; render();
-    send({ type: 'gh-tree', repo: S.gh.repo, branch: S.gh.branch, files: payload });
+    ghAsk('gh-tree', { repo: S.gh.repo, branch: S.gh.branch, files: payload }, 'the change preview');
     return true;
   }
   if (act === 'gh-push') {
@@ -2679,7 +2793,7 @@ window.onmessage = ev => {
   const m = ev.data && ev.data.pluginMessage; if (!m) return;
   if (['loading', 'state', 'code', 'download', 'error', 'thumb', 'project', 'design-shot', 'fonts-updated', 'ann-result', 'tokens',
     'plan', 'store', 'store-ok', 'store-error', 'gh-status', 'gh-repos', 'gh-branches', 'gh-created', 'gh-tree', 'gh-committed',
-    'a11y-report', 'a11y-ignored'].indexOf(m.type) === -1) return;
+    'a11y-report', 'a11y-ignored', 'invalid'].indexOf(m.type) === -1) return;
   S.got = true; S.demo = false;
   if (m.type === 'loading') $('bar').classList.add('on');
   else if (m.type === 'state') {
@@ -2738,7 +2852,24 @@ window.onmessage = ev => {
     download(m.zipName, makeZip(m.files.map(f => ({ name: f.name, bytes: f.bytes || enc.encode(f.text) }))), MIME.zip);
     toast('Project downloaded');
   }
-  else if (m.type === 'error') { $('bar').classList.remove('on'); toast(m.message); }
+  else if (m.type === 'error') {
+    // A rejected or failed request must release the controls it disabled, or the
+    // panel looks frozen: no spinner stops, no button becomes pressable again.
+    $('bar').classList.remove('on');
+    ghSettle();
+    Object.keys(pending).forEach(k => { pending[k] = false; });
+    filesFail(m.message);
+    if (S.tab === 'github' || S.tab === 'files') render();
+    toast(m.message);
+  }
+  else if (m.type === 'invalid') {
+    $('bar').classList.remove('on');
+    ghSettle();
+    Object.keys(pending).forEach(k => { pending[k] = false; });
+    filesFail(m.message);
+    if (S.tab === 'github' || S.tab === 'files') render();
+    toast(m.message || 'DevReady refused that request');
+  }
   else if (m.type === 'plan') {
     S.plan = m;
     if (S.tab === 'overview') render();
@@ -2751,20 +2882,20 @@ window.onmessage = ev => {
   else if (m.type === 'store-ok') { /* silent */ }
   else if (m.type === 'store-error') { toast('Could not save locally: ' + m.message); }
   else if (m.type === 'gh-status') {
-    S.gh.pending = false;
+    ghSettle();
     S.gh.status = m.status || { connected: false };
     S.gh.busy = '';
-    if (S.gh.status.connected) { S.gh.error = null; S.gh.busy = 'repos'; send({ type: 'gh-repos' }); }
+    if (S.gh.status.connected) { S.gh.error = null; S.gh.busy = 'repos'; ghAsk('gh-repos', null, 'the repository list'); }
     if (S.tab === 'github' || S.tab === 'settings') render();
   }
   else if (m.type === 'gh-repos') {
-    S.gh.busy = '';
+    ghSettle();
     if (m.ok) { S.gh.repos = m.repos || []; S.gh.error = null; }
     else S.gh.error = m.error;
     if (S.tab === 'github') render();
   }
   else if (m.type === 'gh-branches') {
-    S.gh.busy = '';
+    ghSettle();
     if (m.ok) {
       S.gh.branches = m.branches || [];
       if (!S.gh.branch || !S.gh.branches.some(b => b.name === S.gh.branch)) S.gh.branch = (S.gh.branches[0] || {}).name || '';
@@ -2773,18 +2904,18 @@ window.onmessage = ev => {
     if (S.tab === 'github') render();
   }
   else if (m.type === 'gh-created') {
-    S.gh.busy = '';
-    if (m.ok && m.repo) { S.gh.repo = m.repo.fullName; S.gh.branch = m.repo.defaultBranch; S.gh.branches = [{ name: m.repo.defaultBranch }]; S.form = null; toast('Repository created'); send({ type: 'gh-repos' }); }
+    ghSettle();
+    if (m.ok && m.repo) { S.gh.repo = m.repo.fullName; S.gh.branch = m.repo.defaultBranch; S.gh.branches = [{ name: m.repo.defaultBranch }]; S.form = null; toast('Repository created'); ghAsk('gh-repos', null, 'the repository list'); }
     else if (m.error) { S.gh.error = m.error; toast(m.error.message); }
     if (S.tab === 'github') render();
   }
   else if (m.type === 'gh-tree') {
-    S.gh.busy = '';
+    ghSettle();
     if (m.ok) { S.gh.tree = m; S.gh.error = null; } else S.gh.error = m.error;
     if (S.tab === 'github') render();
   }
   else if (m.type === 'gh-committed') {
-    S.gh.busy = '';
+    ghSettle();
     if (m.ok) { S.gh.result = m.result; S.gh.error = null; S.gh.tree = null; activate('Pushed ' + m.result.files + ' files to ' + m.result.branch); }
     else { S.gh.error = m.error; toast('GitHub: ' + (m.error && m.error.message || 'push failed')); }
     if (S.tab === 'github') render();
@@ -2883,9 +3014,10 @@ send({ type: 'store-get', key: 'history' });
 send({ type: 'plan' });
 setTimeout(() => {
   if (S.got) return;
-  S.demo = true; S.data = JSON.parse(JSON.stringify(DEMO));
-  Object.keys(DEMO_THUMBS).forEach(k => { S.thumbs[k] = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(DEMO_THUMBS[k]); });
-  render();
+  // Opened as a plain file, with no plugin thread to answer: the samples are the point.
+  // Opened by Figma, the same silence is a failure and is reported as one.
+  if (window.parent && window.parent !== window) { S.disconnected = true; render(); return; }
+  useSamples();
 }, 1500);
 </script>
 </body>
